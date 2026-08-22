@@ -94,21 +94,21 @@ def impute_maxspeed(gdf, min_group_n=10, min_fclass_n=30, min_parent_n=5, speed_
     (division by zero, or roads that look infinitely fast). This replaces every 0/missing
     value using the most specific real signal available, falling back progressively:
 
-      Level 0  observed          — a real, non-zero maxspeed value. Trusted as-is.
-      Level 1  fclass_ref_median — median of real values sharing the same (fclass, ref
+      Level 0  observed          : a real, non-zero maxspeed value. Trusted as-is.
+      Level 1  fclass_ref_median : median of real values sharing the same (fclass, ref
                                     prefix), e.g. ("primary", "R") for provincial R-roads.
                                     Used only where >= min_group_n real samples exist.
-      Level 2  fclass_median     — median of real values for the fclass alone, used only
+      Level 2  fclass_median     : median of real values for the fclass alone, used only
                                     where >= min_fclass_n real samples exist.
-      Level 3  parent_class      — borrows from a related class: *_link classes fall back
+      Level 3  parent_class      : borrows from a related class: *_link classes fall back
                                     to their base class (trunk_link -> trunk); track_gradeN
                                     classes fall back to the combined median across all
                                     track* grades. Used only where the parent itself has
                                     >= min_parent_n real samples.
-      Level 4  domain_default    — a documented, not-fitted assumption table based on
+      Level 4  domain_default    : a documented, not-fitted assumption table based on
                                     typical South African road design speeds. Last resort.
 
-    Every row keeps a `speed_source` label recording which tier it came from — this is
+    Every row keeps a `speed_source` label recording which tier it came from, this is
     what makes the imputation auditable rather than a black box.
     """
     df = gdf.copy()
@@ -118,7 +118,7 @@ def impute_maxspeed(gdf, min_group_n=10, min_fclass_n=30, min_parent_n=5, speed_
     df["imputed_speed_kmh"] = df["maxspeed_valid"]
     df["speed_source"] = np.where(df["maxspeed_valid"].notna(), "observed", pd.NA)
 
-    # Level 1 — (fclass, ref_prefix) group median
+    # Level 1: (fclass, ref_prefix) group median
     grp1 = df.groupby(["fclass", "ref_prefix"])["maxspeed_valid"].agg(["median", "count"])
     for (fclass, ref_prefix), row in grp1.iterrows():
         if row["count"] >= min_group_n:
@@ -127,7 +127,7 @@ def impute_maxspeed(gdf, min_group_n=10, min_fclass_n=30, min_parent_n=5, speed_
             df.loc[mask, "imputed_speed_kmh"] = row["median"]
             df.loc[mask, "speed_source"] = "fclass_ref_median"
 
-    # Level 2 — fclass-only median (computed from ALL real observations for that fclass,
+    # Level 2: fclass-only median (computed from ALL real observations for that fclass,
     # not just what's left unfilled, so the sample size check is against the true support)
     grp2 = df.groupby("fclass")["maxspeed_valid"].agg(["median", "count"])
     for fclass, row in grp2.iterrows():
@@ -136,9 +136,9 @@ def impute_maxspeed(gdf, min_group_n=10, min_fclass_n=30, min_parent_n=5, speed_
             df.loc[mask, "imputed_speed_kmh"] = row["median"]
             df.loc[mask, "speed_source"] = "fclass_median"
 
-    # Level 3 — parent-class borrowing. Deliberately excludes track_gradeN: real samples
+    # Level 3: parent-class borrowing. Deliberately excludes track_gradeN: real samples
     # per grade are too sparse (2-33 observations) and noisy to trust a combined "all
-    # track grades" average — that would erase the whole point of grading (a maintained
+    # track grades" average, that would erase the whole point of grading (a maintained
     # grade1 track and a barely-passable grade5 track would wrongly get the same speed).
     # Ungraded *_link classes reasonably do share their parent's character, so those still
     # borrow; track_gradeN instead falls through to the grade-differentiated domain
@@ -158,12 +158,12 @@ def impute_maxspeed(gdf, min_group_n=10, min_fclass_n=30, min_parent_n=5, speed_
             df.loc[mask, "imputed_speed_kmh"] = value
             df.loc[mask, "speed_source"] = "parent_class_median"
 
-    # Level 4 — documented domain-default table (last resort)
+    # Level 4: documented domain-default table (last resort)
     mask = df["imputed_speed_kmh"].isna()
     df.loc[mask, "imputed_speed_kmh"] = df.loc[mask, "fclass"].map(DEFAULT_SPEED_KMH).fillna(40)
     df.loc[mask, "speed_source"] = "domain_default"
 
-    # A vehicle cannot travel at ~0 km/h even in principle — floor any residual extreme
+    # A vehicle cannot travel at ~0 km/h even in principle, floor any residual extreme
     # low value (e.g. a genuine but implausible observed maxspeed=2 on one segment).
     df["imputed_speed_kmh"] = df["imputed_speed_kmh"].clip(lower=speed_floor_kmh)
 
@@ -175,7 +175,7 @@ def clean_and_enrich(gdf, exclude_fclass=EXCLUDE_FCLASS,
     gdf = gdf[~gdf["fclass"].isin(exclude_fclass)].copy()
     gdf["geometry"] = gdf.geometry.simplify(tolerance=simplify_tol, preserve_topology=True)
 
-    # accurate geodesic length — avoids UTM-zone distortion across the province
+    # accurate geodesic length, avoids UTM-zone distortion across the province
     gdf["length_km"] = gdf.geometry.apply(lambda g: GEOD.geometry_length(g) / 1000)
 
     # tiered maxspeed imputation (see impute_maxspeed docstring for the method)
@@ -205,7 +205,7 @@ def build_graph(gdf, snap_tol_m=SNAP_TOLERANCE_M):
 
     node_list = list(raw_nodes)
     mean_lat = np.mean([n[1] for n in node_list])
-    mx = 111320 * np.cos(np.radians(mean_lat))
+    mx = 111320 * np.cos(np.radians(mean_lat)) # convert the lon/lat degree coordinates to meters for snapping
     my = 110540
     pts_m = np.array([[n[0] * mx, n[1] * my] for n in node_list])
 
@@ -273,7 +273,7 @@ def projection_scale(mean_lat):
 
 
 # ---------------------------------------------------------------------------
-# Routing — weight functions and Standard vs Fisheries-Optimized comparison
+# Routing: weight functions and Standard vs Fisheries-Optimized comparison
 # ---------------------------------------------------------------------------
 def make_time_weight(border_nodes):
     def weight_fn(u, v, d):

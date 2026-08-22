@@ -26,6 +26,7 @@ import networkx as nx
 import numpy as np
 import uvicorn
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from scipy.spatial import cKDTree
 
@@ -224,6 +225,17 @@ logger.info(
 )
 
 app = FastAPI(title="Northern Cape Fleet Telemetry and Routing API")
+
+# CORS: the dispatch map now polls this API directly from client-side JS running
+# inside a components.html iframe (srcdoc origin), instead of via Streamlit's
+# Python process. Without this, the browser blocks the fetch() calls entirely.
+# Wide open on purpose since this only ever binds to 127.0.0.1 for local/demo use.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
 
 
 # ---------------------------------------------------------------------------
