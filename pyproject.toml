@@ -1,0 +1,23 @@
+[project]
+name = "mictseta-hackathon"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "folium>=0.20.0",
+    "geopandas>=1.1.4",
+    "ipykernel>=7.3.0",
+    "leafmap>=0.63.1",
+    "mapclassify>=2.11.0",
+    "matplotlib>=3.11.1",
+    "networkx>=3.6.1",
+    "numpy>=2.5.2",
+    "openpyxl>=3.1.5",
+    "ortools>=9.15.6755",
+    "osmnx>=2.1.1",
+    "pandas>=3.0.5",
+    "pyarrow>=25.0.1",
+    "scikit-learn>=1.9.0",
+    "scipy>=1.18.0",
+]
