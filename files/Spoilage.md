@@ -1,6 +1,7 @@
 # Technical Framework: Cold-Chain Vulnerability and Spoilage Risk Model
 
 ## Executive Summary
+### spoilage\_cost = base_time_mins * Roughness Penalty + Customs Delay Penalty
 In standard routing logistics, pathfinders like Google Maps optimize strictly for time or distance. For high-value marine cargo like wild-caught fish or abalone traversing the Northern Cape, this approach fails. 
 
 Even inside a state-of-the-art refrigerated vehicle (reefer), the cargo remains highly vulnerable to environmental factors. Our optimization model introduces a Cold-Chain Vulnerability Index (CCVI). This index treats road surface quality and ambient desert heat as active mechanical risks, mathematically driving the pathfinder to select routes that preserve cargo integrity.

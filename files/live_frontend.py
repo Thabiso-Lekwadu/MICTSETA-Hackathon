@@ -1,419 +1,385 @@
 """
 live_frontend.py
 
-Streamlit dashboard for the Northern Cape Fleet Dispatch system. The Fleet Dispatch Hub
-tab renders a persistent Leaflet map driven entirely by client-side JavaScript: a
-setInterval loop polls live_backend.py directly from the browser and a
-requestAnimationFrame loop tweens the truck marker between fixes, so the map is never
-torn down and rebuilt by a Streamlit rerun. Tab B is an ordinary Streamlit form that
-lets drivers, fishermen, and cooperative supervisors submit ground-truth road condition
-reports that immediately affect routing.
+Streamlit command dashboard for the Northern Cape Fleet Dispatch system.
+Talks to live_backend.py (FastAPI, http://127.0.0.1:8000) over plain HTTP.
 
-Requires live_backend.py to already be running on http://127.0.0.1:8000.
+Two tabs:
+  Fleet Dispatch Hub       - live map + metrics, switchable between a real
+                              Traccar Client phone feed and a built-in simulator.
+  Driver Ground-Truth Form - crowd-sourced road-condition reports that trigger
+                              live reroutes on the backend.
 
-Run:
+Run standalone (uv workspace, alongside a running live_backend.py):
     uv run streamlit run live_frontend.py
 """
 
+
 from __future__ import annotations
 
-import json
+import asyncio
+import sys
 
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+import logging
+import time
+from datetime import datetime
+
+import folium
 import requests
 import streamlit as st
+from streamlit_folium import st_folium
 
-BACKEND_BASE_URL = "http://127.0.0.1:8000"
-TELEMATICS_ENDPOINT = f"{BACKEND_BASE_URL}/v1/telematics/truck-01"
-ROUTING_ENDPOINT = f"{BACKEND_BASE_URL}/v1/routing/truck-01"
-REPORTS_ENDPOINT = f"{BACKEND_BASE_URL}/v1/reports/submit"
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+BACKEND_URL = "http://127.0.0.1:8000"
+POLL_INTERVAL_SECONDS = 2
+REQUEST_TIMEOUT_SECONDS = 5
 
-REQUEST_TIMEOUT_SECONDS = 5.0
+MODE_HARDWARE = "📡 Live Mobile Hardware Tracking (Traccar)"
+MODE_SIMULATOR = "🤖 Automated Ingestion Simulator"
 
-# Sample coordinates for the field report form, spanning the Port Nolloth to Upington
-# corridor, so a presenter can pick a realistic location without typing raw decimals.
-# The Springbok corridor entry is a verified reroute-triggering location: reporting it
-# as Impassable will visibly shift the dispatch map's route.
-SAMPLE_LOCATIONS: dict[str, tuple[float, float]] = {
-    "N7 near Springbok (verified reroute trigger)": (-29.307839, 17.138515),
-    "N14 near Pofadder": (-29.1333, 19.4000),
-    "Coastal track near Port Nolloth": (-29.2100, 16.9200),
-    "N14 near Kenhardt": (-29.3333, 21.1500),
-    "Custom coordinates": None,
-}
+FEED_SOURCE_REAL = "REAL-TIME TRACCAR HARDWARE"
+FEED_SOURCE_SIMULATED = "SIMULATED TELEMETRY MATRIX"
 
-ROAD_CONDITIONS = [
-    "Smooth Tarmac",
-    "Corrugated / Rough Gravel",
-    "Severe Potholes",
-    "Impassable / Washed Out",
-]
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("live_frontend")
 
-REPORTER_ROLES = ["Driver", "Fisherman", "Cooperative Supervisor"]
-
-# Fixed map center (the corridor midpoint). Never recalculated from the current
-# route, so the camera doesn't jump or recentre as the vehicle moves.
-MAP_CENTER = [-29.3, 19.0]
-MAP_ZOOM = 6
-
-st.set_page_config(page_title="Northern Cape Fleet Dispatch", layout="wide")
+st.set_page_config(
+    page_title="Northern Cape Fleet Dispatch",
+    page_icon="🚛",
+    layout="wide",
+)
 
 
 # ---------------------------------------------------------------------------
-# Backend client helpers (used only by the Tab B form, which is a normal
-# Streamlit POST-on-click interaction; the animated map in Tab A talks to the
-# backend directly from JS instead, see render_dispatch_component below)
+# Backend client helpers — every call is wrapped so an offline backend
+# degrades gracefully instead of crashing the dashboard.
 # ---------------------------------------------------------------------------
-def submit_field_report(payload: dict) -> tuple[dict | None, str | None]:
+def backend_get(path: str) -> dict | None:
     try:
-        response = requests.post(REPORTS_ENDPOINT, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
+        response = requests.get(f"{BACKEND_URL}{path}", timeout=REQUEST_TIMEOUT_SECONDS)
         response.raise_for_status()
-        return response.json(), None
-    except requests.exceptions.RequestException as exc:
-        return None, str(exc)
-
-
-# ---------------------------------------------------------------------------
-# Session state initialization
-# ---------------------------------------------------------------------------
-if "live_tracking_enabled" not in st.session_state:
-    st.session_state.live_tracking_enabled = True
-if "last_report_result" not in st.session_state:
-    st.session_state.last_report_result = None
-if "last_report_error" not in st.session_state:
-    st.session_state.last_report_error = None
-
-
-st.title("Northern Cape Fleet Dispatch")
-st.caption("Transport, Trade and Fisheries corridor: Port Nolloth to Upington")
-
-tab_dispatch, tab_form = st.tabs(["Fleet Dispatch Hub", "Driver Ground-Truth Form"])
-
-
-# ---------------------------------------------------------------------------
-# TAB A: Fleet Dispatch Hub
-#
-# Why the old approach flickered: time.sleep() + st.rerun() (and later the
-# st.fragment(run_every=...) version) re-executed the whole render function on
-# every cycle. st_folium tears the Folium map down and rebuilds it from scratch
-# each time it re-runs, so the map flashed white and the marker "teleported"
-# from wherever it last was straight to the new fix, instead of gliding.
-#
-# Fix: render the map exactly once as a components.html iframe containing a
-# plain Leaflet map (not Folium/st_folium — Folium has no notion of "update
-# this marker in place", it only knows how to draw a fresh map). The iframe's
-# own JavaScript then:
-#   1. polls the backend directly with fetch(), independent of Streamlit's
-#      script-run cycle entirely, and
-#   2. tweens the marker from its last position to the newly-fetched position
-#      over the poll interval using requestAnimationFrame, instead of
-#      snapping to it.
-# Streamlit only re-renders this component when refresh_interval_seconds
-# changes (a deliberate user action on the slider), never on a timer.
-# ---------------------------------------------------------------------------
-def render_dispatch_component(refresh_interval_seconds: int) -> None:
-    config = {
-        "telematicsUrl": TELEMATICS_ENDPOINT,
-        "routingUrl": ROUTING_ENDPOINT,
-        "healthUrl": BACKEND_BASE_URL + "/",
-        "pollMs": refresh_interval_seconds * 1000,
-        "mapCenter": MAP_CENTER,
-        "mapZoom": MAP_ZOOM,
-    }
-    config_json = json.dumps(config)
-
-    component_html = f"""
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8" />
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css" />
-<style>
-  html, body {{
-    margin: 0; padding: 0; background: #0e1117;
-    font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
-  }}
-  #status-bar {{
-    display: flex; flex-wrap: wrap; gap: 10px;
-    padding: 10px 4px 14px 4px;
-  }}
-  .metric {{
-    background: #161b22; border: 1px solid #262b33; border-radius: 8px;
-    padding: 10px 16px; min-width: 150px; flex: 1;
-  }}
-  .metric-label {{
-    color: #8b949e; font-size: 11px; text-transform: uppercase;
-    letter-spacing: 0.04em; margin-bottom: 4px;
-  }}
-  .metric-value {{
-    color: #e6edf3; font-size: 20px; font-weight: 600; font-variant-numeric: tabular-nums;
-  }}
-  .metric-value.route-standard {{ color: #3fb950; }}
-  .metric-value.route-detour {{ color: #f85149; }}
-  #map {{
-    height: 560px; width: 100%; border-radius: 8px; border: 1px solid #262b33;
-    background: #161b22;
-  }}
-  #connection-banner {{
-    display: none; background: #4a1414; color: #ffb4b4; border: 1px solid #f85149;
-    border-radius: 8px; padding: 10px 14px; margin-bottom: 10px; font-size: 13px;
-  }}
-  #connection-banner.visible {{ display: block; }}
-</style>
-</head>
-<body>
-  <div id="connection-banner">
-    Backend server is offline or unreachable. Start it with: uv run live_backend.py
-  </div>
-  <div id="status-bar">
-    <div class="metric"><div class="metric-label">Active Vehicle ID</div><div class="metric-value" id="m-vehicle">&mdash;</div></div>
-    <div class="metric"><div class="metric-label">Cargo Temperature (&deg;C)</div><div class="metric-value" id="m-temp">&mdash;</div></div>
-    <div class="metric"><div class="metric-label">Current Coordinates</div><div class="metric-value" id="m-coords">&mdash;</div></div>
-    <div class="metric"><div class="metric-label">Route Status</div><div class="metric-value" id="m-status">&mdash;</div></div>
-  </div>
-  <div id="map"></div>
-  <div id="status-bar">
-    <div class="metric"><div class="metric-label">Total Time (mins)</div><div class="metric-value" id="m-time">&mdash;</div></div>
-    <div class="metric"><div class="metric-label">Total Spoilage Cost</div><div class="metric-value" id="m-spoilage">&mdash;</div></div>
-    <div class="metric"><div class="metric-label">Route Hop Count</div><div class="metric-value" id="m-hops">&mdash;</div></div>
-  </div>
-
-<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
-<script>
-(function() {{
-  const CONFIG = {config_json};
-
-  const map = L.map('map', {{ zoomControl: true }}).setView(CONFIG.mapCenter, CONFIG.mapZoom);
-  L.tileLayer('https://{{s}}.basemaps.cartocdn.com/light_all/{{z}}/{{x}}/{{y}}{{r}}.png', {{
-    attribution: '&copy; OpenStreetMap contributors &copy; CARTO',
-    subdomains: 'abcd', maxZoom: 19,
-  }}).addTo(map);
-
-  // Leaflet sizes its tile grid off the #map div's dimensions at the instant
-  // L.map() runs. Inside an iframe that Streamlit is still laying out, that
-  // can be a stale/partial size, which throws off tile alignment and centering
-  // until something forces a recalculation. invalidateSize() does that; call
-  // it once shortly after load and again on any later resize of the iframe.
-  setTimeout(function() {{ map.invalidateSize(); map.setView(CONFIG.mapCenter, CONFIG.mapZoom); }}, 200);
-  window.addEventListener('resize', function() {{ map.invalidateSize(); }});
-
-  const truckIcon = L.divIcon({{
-    className: '', html: '<div style="font-size:22px;transform:translate(-50%,-50%);">&#128666;</div>',
-    iconSize: [0, 0],
-  }});
-  const flagIcon = L.divIcon({{
-    className: '', html: '<div style="font-size:20px;transform:translate(-50%,-90%);">&#127937;</div>',
-    iconSize: [0, 0],
-  }});
-
-  let routeLine = null;
-  let vehicleMarker = null;
-  let destinationMarker = null;
-
-  // Animation state: we always animate from `displayLatLng` (where the marker
-  // visually is right now) to `targetLatLng` (the most recently fetched fix),
-  // over `pollMs` milliseconds, using requestAnimationFrame. A new fetch simply
-  // retargets the animation instead of snapping the marker.
-  let displayLatLng = null;
-  let targetLatLng = null;
-  let animStartTime = null;
-  let animStartLatLng = null;
-  let animFrameHandle = null;
-
-  function lerp(a, b, t) {{ return a + (b - a) * t; }}
-
-  function animationStep(timestamp) {{
-    if (!targetLatLng) {{ animFrameHandle = requestAnimationFrame(animationStep); return; }}
-    if (animStartTime === null) {{ animStartTime = timestamp; animStartLatLng = displayLatLng || targetLatLng; }}
-
-    const elapsed = timestamp - animStartTime;
-    const t = Math.min(1, elapsed / CONFIG.pollMs);
-    // ease-in-out so the truck doesn't jerk to a stop right as the next fetch lands
-    const eased = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
-
-    const lat = lerp(animStartLatLng[0], targetLatLng[0], eased);
-    const lon = lerp(animStartLatLng[1], targetLatLng[1], eased);
-    displayLatLng = [lat, lon];
-
-    if (!vehicleMarker) {{
-      vehicleMarker = L.marker(displayLatLng, {{ icon: truckIcon }}).addTo(map);
-    }} else {{
-      vehicleMarker.setLatLng(displayLatLng);
-    }}
-
-    animFrameHandle = requestAnimationFrame(animationStep);
-  }}
-  animFrameHandle = requestAnimationFrame(animationStep);
-
-  function setConnectionOk(isOk) {{
-    document.getElementById('connection-banner').classList.toggle('visible', !isOk);
-  }}
-
-  function updateRoute(routing) {{
-    const latlngs = routing.path.map(function(coord) {{ return [coord[1], coord[0]]; }});
-    const color = routing.detour_active ? '#f85149' : '#3fb950';
-
-    if (!routeLine) {{
-      routeLine = L.polyline(latlngs, {{ color: color, weight: 5 }}).addTo(map);
-    }} else {{
-      // Update the existing layer in place rather than removing/re-adding it —
-      // this is what avoids the map-wide redraw flash.
-      routeLine.setLatLngs(latlngs);
-      routeLine.setStyle({{ color: color }});
-    }}
-
-    if (latlngs.length) {{
-      const destination = latlngs[latlngs.length - 1];
-      if (!destinationMarker) {{
-        destinationMarker = L.marker(destination, {{ icon: flagIcon }})
-          .bindPopup('Destination hub: Upington')
-          .addTo(map);
-      }} else {{
-        destinationMarker.setLatLng(destination);
-      }}
-    }}
-
-    document.getElementById('m-status').textContent = routing.detour_active ? 'DETOUR ACTIVE' : 'Standard route';
-    document.getElementById('m-status').className = 'metric-value ' + (routing.detour_active ? 'route-detour' : 'route-standard');
-    document.getElementById('m-time').textContent = routing.total_time_mins.toFixed(1);
-    document.getElementById('m-spoilage').textContent = routing.total_spoilage_cost.toFixed(2);
-    document.getElementById('m-hops').textContent = routing.hop_count;
-  }}
-
-  function updateTelemetry(telemetry) {{
-    document.getElementById('m-vehicle').textContent = telemetry.vehicle_id;
-    document.getElementById('m-temp').textContent = telemetry.cargo_temp_c.toFixed(2);
-    document.getElementById('m-coords').textContent = telemetry.lat.toFixed(4) + ', ' + telemetry.lon.toFixed(4);
-
-    const newTarget = [telemetry.lat, telemetry.lon];
-    if (!displayLatLng) {{ displayLatLng = newTarget; }}
-    targetLatLng = newTarget;
-    animStartTime = null; // retarget: next animation frame restarts the tween from wherever we are now
-  }}
-
-  async function pollOnce() {{
-    try {{
-      const [telemetryResponse, routingResponse] = await Promise.all([
-        fetch(CONFIG.telematicsUrl), fetch(CONFIG.routingUrl),
-      ]);
-      if (!telemetryResponse.ok || !routingResponse.ok) throw new Error('non-200 response');
-      const telemetry = await telemetryResponse.json();
-      const routing = await routingResponse.json();
-      updateTelemetry(telemetry);
-      updateRoute(routing);
-      setConnectionOk(true);
-    }} catch (err) {{
-      setConnectionOk(false);
-    }}
-  }}
-
-  pollOnce();
-  setInterval(pollOnce, CONFIG.pollMs);
-}})();
-</script>
-</body>
-</html>
-"""
-    # components.v1.html is deprecated in current Streamlit versions in favour of
-    # st.iframe, which auto-detects an HTML string and embeds it the same way
-    # (srcdoc, JS execution allowed) — no import beyond `streamlit as st` needed.
-    # height="content" lets Streamlit measure the actual rendered height instead
-    # of a hardcoded guess, so the map isn't clipped with an internal scrollbar.
-    st.iframe(component_html, height="content")
-
-
-with tab_dispatch:
-    st.session_state.live_tracking_enabled = st.checkbox(
-        "Enable live auto-refresh",
-        value=st.session_state.live_tracking_enabled,
-    )
-
-    # Defensive guard: recent Streamlit versions reconnect an interrupted
-    # WebSocket (e.g. the Windows ConnectionResetError noise you saw) into the
-    # *existing* session instead of restarting it, which can replay a
-    # widget's session_state value from before a code edit. If that stored
-    # value no longer belongs to REFRESH_OPTIONS, select_slider raises
-    # "X is not in iterable" instead of just falling back to the default.
-    # Clearing the stale entry before instantiating the widget self-heals it.
-    REFRESH_OPTIONS = [2, 3, 5, 8]
-    REFRESH_KEY = "refresh_interval_seconds"
-    if REFRESH_KEY in st.session_state and st.session_state[REFRESH_KEY] not in REFRESH_OPTIONS:
-        del st.session_state[REFRESH_KEY]
-
-    refresh_seconds = st.select_slider(
-        "Refresh interval (seconds)", options=REFRESH_OPTIONS, value=3, key=REFRESH_KEY,
-    )
-
-    if st.session_state.live_tracking_enabled:
-        render_dispatch_component(refresh_seconds)
-    else:
-        st.info("Live tracking paused. Enable it above to resume the dispatch map.")
-
-
-# ---------------------------------------------------------------------------
-# TAB B: Driver Ground-Truth Form (unchanged — a normal Streamlit form, so its
-# occasional reruns on submit are fine; it never touches the animated map)
-# ---------------------------------------------------------------------------
-with tab_form:
-    st.subheader("Field Report")
-    st.caption(
-        "Simulates the mobile form a driver, fisherman, or cooperative supervisor would "
-        "use from a loading bay or truck stop to report current road conditions."
-    )
-
-    reporter_role = st.selectbox("Select Role", REPORTER_ROLES)
-
-    location_choice = st.selectbox("Location", list(SAMPLE_LOCATIONS.keys()))
-    if SAMPLE_LOCATIONS[location_choice] is not None:
-        default_lat, default_lon = SAMPLE_LOCATIONS[location_choice]
-    else:
-        default_lat, default_lon = -29.3078, 17.1385
-
-    coordinate_col_1, coordinate_col_2 = st.columns(2)
-    with coordinate_col_1:
-        report_lat = st.number_input(
-            "Latitude", value=default_lat, min_value=-90.0, max_value=90.0, format="%.6f"
-        )
-    with coordinate_col_2:
-        report_lon = st.number_input(
-            "Longitude", value=default_lon, min_value=-180.0, max_value=180.0, format="%.6f"
-        )
-
-    road_condition = st.selectbox("Current Road Condition", ROAD_CONDITIONS)
-    actual_speed = st.number_input(
-        "Actual Traffic Speed (km/h)", min_value=1.0, max_value=160.0, value=40.0, step=1.0
-    )
-
-    if st.button("Submit Field Report", type="primary"):
-        payload = {
-            "reporter_role": reporter_role,
-            "lat": report_lat,
-            "lon": report_lon,
-            "road_condition": road_condition,
-            "actual_speed": actual_speed,
-        }
-        result, error = submit_field_report(payload)
-        st.session_state.last_report_result = result
-        st.session_state.last_report_error = error
-
-    if st.session_state.last_report_error is not None:
+        return response.json()
+    except requests.exceptions.ConnectionError:
         st.error(
-            "Could not reach the backend server to submit this report. "
-            f"Detail: {st.session_state.last_report_error}"
+            "🔌 Cannot reach the backend server. Is `live_backend.py` running? "
+            f"Expected at {BACKEND_URL}"
         )
-    elif st.session_state.last_report_result is not None:
-        result = st.session_state.last_report_result
-        if road_condition in ("Severe Potholes", "Impassable / Washed Out"):
-            st.warning(
-                f"Report submitted: {road_condition} confirmed on segment "
-                f"{result['matched_segment']} ({result['distance_from_report_km']:.2f} km "
-                f"from your reported location). The routing engine has been updated. "
-                f"The Fleet Dispatch Hub tab will pick up the reroute on its next poll."
+        logger.error("GET %s failed: connection error", path)
+        return None
+    except requests.exceptions.Timeout:
+        st.error(f"⏱️ Backend request to `{path}` timed out.")
+        logger.error("GET %s failed: timeout", path)
+        return None
+    except requests.exceptions.HTTPError as exc:
+        st.error(f"⚠️ Backend returned an error for `{path}`: {exc}")
+        logger.error("GET %s failed: %s", path, exc)
+        return None
+    except requests.exceptions.RequestException as exc:
+        st.error(f"⚠️ Unexpected error calling `{path}`: {exc}")
+        logger.error("GET %s failed: %s", path, exc)
+        return None
+
+
+def backend_post(path: str, json_body: dict | None = None) -> dict | None:
+    try:
+        response = requests.post(
+            f"{BACKEND_URL}{path}", json=json_body, timeout=REQUEST_TIMEOUT_SECONDS
+        )
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.ConnectionError:
+        st.error(
+            "🔌 Cannot reach the backend server. Is `live_backend.py` running? "
+            f"Expected at {BACKEND_URL}"
+        )
+        logger.error("POST %s failed: connection error", path)
+        return None
+    except requests.exceptions.Timeout:
+        st.error(f"⏱️ Backend request to `{path}` timed out.")
+        logger.error("POST %s failed: timeout", path)
+        return None
+    except requests.exceptions.HTTPError as exc:
+        try:
+            detail = response.json().get("detail", str(exc))
+        except Exception:
+            detail = str(exc)
+        st.error(f"⚠️ Backend rejected `{path}`: {detail}")
+        logger.error("POST %s failed: %s", path, detail)
+        return None
+    except requests.exceptions.RequestException as exc:
+        st.error(f"⚠️ Unexpected error calling `{path}`: {exc}")
+        logger.error("POST %s failed: %s", path, exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Session state initialization — persists the last known telemetry/routing
+# payloads across Streamlit reruns so the dashboard still shows something
+# sensible even when the polling loop is paused.
+# ---------------------------------------------------------------------------
+if "pipeline_running" not in st.session_state:
+    st.session_state.pipeline_running = False
+if "last_telematics" not in st.session_state:
+    st.session_state.last_telematics = None
+if "last_routing" not in st.session_state:
+    st.session_state.last_routing = None
+if "last_poll_time" not in st.session_state:
+    st.session_state.last_poll_time = None
+
+
+# ---------------------------------------------------------------------------
+# Sidebar controls
+# ---------------------------------------------------------------------------
+st.sidebar.title("🚛 Fleet Control Panel")
+
+telemetry_mode = st.sidebar.selectbox(
+    "Telemetry Mode",
+    options=[MODE_HARDWARE, MODE_SIMULATOR],
+    index=1,
+    help=(
+        "Hardware mode reads whatever the Traccar Client phone app most recently "
+        "pushed to /v1/telematics/incoming. Simulator mode advances a hardcoded "
+        "5-point route on every poll."
+    ),
+)
+
+st.sidebar.divider()
+
+pipeline_toggle = st.sidebar.toggle(
+    "🚦 Launch Ingestion Pipeline",
+    value=st.session_state.pipeline_running,
+    help="When ON, the dashboard polls the backend every "
+         f"{POLL_INTERVAL_SECONDS}s and auto-refreshes.",
+)
+st.session_state.pipeline_running = pipeline_toggle
+
+if pipeline_toggle:
+    st.sidebar.success("Pipeline running — polling every "
+                        f"{POLL_INTERVAL_SECONDS}s.")
+else:
+    st.sidebar.info("Pipeline paused. Toggle on to start live polling.")
+
+if telemetry_mode == MODE_HARDWARE:
+    st.sidebar.caption(
+        "📱 Point Traccar Client's server URL at:\n\n"
+        f"`{BACKEND_URL}/v1/telematics/incoming`\n\n"
+        "using its OsmAnd / query-string protocol."
+    )
+
+st.sidebar.divider()
+st.sidebar.caption(f"Backend: `{BACKEND_URL}`")
+
+
+# ---------------------------------------------------------------------------
+# Tabs
+# ---------------------------------------------------------------------------
+tab_dispatch, tab_field_report = st.tabs(
+    ["🚛 Fleet Dispatch Hub", "📝 Driver Ground-Truth Form"]
+)
+
+
+# ---------------------------------------------------------------------------
+# TAB A — Fleet Dispatch Hub
+# ---------------------------------------------------------------------------
+with tab_dispatch:
+    st.title("Northern Cape Fleet Dispatch Hub")
+    st.caption("Live spoilage-risk-optimized routing for cold-chain fisheries transport.")
+
+    # One polling tick, only performed while the pipeline is toggled on.
+    if st.session_state.pipeline_running:
+        if telemetry_mode == MODE_SIMULATOR:
+            backend_post("/v1/telematics/simulate-step")
+        # In hardware mode we deliberately skip triggering anything here —
+        # the phone pushes to /v1/telematics/incoming on its own schedule.
+
+        telematics_payload = backend_get("/v1/telematics/truck-01")
+        if telematics_payload is not None:
+            st.session_state.last_telematics = telematics_payload
+
+        routing_payload = backend_get("/v1/routing/truck-01")
+        if routing_payload is not None:
+            st.session_state.last_routing = routing_payload
+
+        st.session_state.last_poll_time = datetime.now().strftime("%H:%M:%S")
+
+    telematics = st.session_state.last_telematics
+    routing = st.session_state.last_routing
+
+    if telematics is None:
+        st.warning(
+            "No telemetry received yet. Toggle **Launch Ingestion Pipeline** in the "
+            "sidebar to start polling, and make sure `live_backend.py` is running."
+        )
+    else:
+        feed_source = telematics.get("feed_source", "UNKNOWN")
+
+        # --- Metrics panel ---------------------------------------------------
+        metric_cols = st.columns(5)
+        metric_cols[0].metric("Vehicle ID", telematics.get("vehicle_id", "—"))
+        metric_cols[1].metric(
+            "Current Coordinates",
+            f"{telematics.get('lat', 0):.4f}, {telematics.get('lon', 0):.4f}",
+        )
+        metric_cols[2].metric(
+            "Cargo Temperature",
+            f"{telematics.get('cargo_temp_c', 0):.1f} °C",
+        )
+        if routing is not None:
+            metric_cols[3].metric(
+                "ETA to Upington",
+                f"{routing.get('total_time_mins', 0):.0f} min",
             )
+            metric_cols[4].metric(
+                "Spoilage Cost Index",
+                f"{routing.get('total_spoilage_cost', 0):.2f}",
+                delta="Detour active" if routing.get("detour_active") else "On baseline route",
+                delta_color="inverse" if routing.get("detour_active") else "off",
+            )
+
+        # --- Feed source status card ------------------------------------------
+        if feed_source == FEED_SOURCE_REAL:
+            st.success(f"🟢 Data Feed Source: **{feed_source}**")
+        elif feed_source == FEED_SOURCE_SIMULATED:
+            st.info(f"🔵 Data Feed Source: **{feed_source}**")
         else:
+            st.warning(f"⚪ Data Feed Source: **{feed_source}**")
+
+        if st.session_state.last_poll_time:
+            st.caption(f"Last updated: {st.session_state.last_poll_time}")
+
+        # --- Map ---------------------------------------------------------------
+        st.subheader("Live GPS Map")
+        truck_lat = telematics.get("lat")
+        truck_lon = telematics.get("lon")
+
+        fleet_map = folium.Map(location=[truck_lat, truck_lon], zoom_start=8, tiles="CartoDB positron")
+
+        folium.Marker(
+            location=[truck_lat, truck_lon],
+            popup=f"{telematics.get('vehicle_id', 'Vehicle')} — {feed_source}",
+            tooltip="Current truck position",
+            icon=folium.Icon(color="green" if feed_source == FEED_SOURCE_REAL else "blue", icon="truck", prefix="fa"),
+        ).add_to(fleet_map)
+
+        if routing is not None and routing.get("path"):
+            route_coords = [[lat, lon] for lon, lat in routing["path"]]
+            folium.PolyLine(
+                locations=route_coords,
+                color="red" if routing.get("detour_active") else "#2c7fb8",
+                weight=5,
+                opacity=0.8,
+                tooltip="Spoilage-optimized route to Upington",
+            ).add_to(fleet_map)
+            if route_coords:
+                folium.Marker(
+                    location=route_coords[-1],
+                    popup="Destination Hub: Upington",
+                    icon=folium.Icon(color="darkred", icon="flag-checkered", prefix="fa"),
+                ).add_to(fleet_map)
+
+        st_folium(fleet_map, width=None, height=500, key="fleet_dispatch_map")
+
+    # --- Auto-refresh loop ------------------------------------------------
+    if st.session_state.pipeline_running:
+        time.sleep(POLL_INTERVAL_SECONDS)
+        st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# TAB B — Driver Ground-Truth Form
+# ---------------------------------------------------------------------------
+with tab_field_report:
+    st.title("📝 Driver Ground-Truth Report")
+    st.caption(
+        "Submit a real-time road condition update. Reports override the routing "
+        "impedance for the matched segment immediately — the next routing "
+        "recalculation will reroute around bad conditions automatically."
+    )
+
+    default_lat = None
+    default_lon = None
+    if st.session_state.last_telematics is not None:
+        default_lat = st.session_state.last_telematics.get("lat")
+        default_lon = st.session_state.last_telematics.get("lon")
+
+    with st.form("field_report_form", clear_on_submit=True):
+        reporter_role = st.selectbox(
+            "Who are you reporting as?",
+            options=["Driver", "Fisherman", "Cooperative Supervisor"],
+        )
+
+        col_lat, col_lon = st.columns(2)
+        report_lat = col_lat.number_input(
+            "Latitude",
+            min_value=-90.0,
+            max_value=90.0,
+            value=float(default_lat) if default_lat is not None else -29.0,
+            format="%.6f",
+        )
+        report_lon = col_lon.number_input(
+            "Longitude",
+            min_value=-180.0,
+            max_value=180.0,
+            value=float(default_lon) if default_lon is not None else 20.0,
+            format="%.6f",
+        )
+        st.caption(
+            "Defaults to the truck's last known position. Adjust if you're "
+            "reporting a different location along the route."
+        )
+
+        road_condition = st.selectbox(
+            "Road Condition",
+            options=[
+                "Smooth Tarmac",
+                "Corrugated / Rough Gravel",
+                "Severe Potholes",
+                "Impassable / Washed Out",
+            ],
+        )
+
+        actual_speed = st.number_input(
+            "Actual speed you're able to travel (km/h)",
+            min_value=1.0,
+            max_value=160.0,
+            value=60.0,
+            step=5.0,
+        )
+
+        submitted = st.form_submit_button("🚨 Submit Field Report")
+
+    if submitted:
+        result = backend_post(
+            "/v1/reports/submit",
+            json_body={
+                "reporter_role": reporter_role,
+                "lat": report_lat,
+                "lon": report_lon,
+                "road_condition": road_condition,
+                "actual_speed": actual_speed,
+            },
+        )
+        if result is not None:
             st.success(
-                f"Report submitted: {road_condition} recorded on segment "
-                f"{result['matched_segment']} ({result['distance_from_report_km']:.2f} km "
-                f"from your reported location)."
+                f"✅ Report received and matched to road segment "
+                f"{result['matched_segment']} "
+                f"({result['distance_from_report_km']:.2f} km from your reported position)."
             )
-        with st.expander("Applied override details"):
             st.json(result["applied_override"])
+            st.info(
+                f"Total active field reports currently affecting routing: "
+                f"**{result['active_report_count']}**"
+            )
+            logger.info(
+                "Field report submitted: role=%s condition=%s segment=%s",
+                reporter_role, road_condition, result["matched_segment"],
+            )

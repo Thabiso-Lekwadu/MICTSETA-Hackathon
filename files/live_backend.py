@@ -2,14 +2,21 @@
 live_backend.py
 
 FastAPI backend for the Northern Cape Fleet Dispatch system. Loads the pre-compiled
-road network topology (nc_road_graph.pkl), streams simulated live vehicle telemetry,
-computes spoilage-risk-optimized routes, and accepts crowd-sourced driver ground-truth
-reports that override the routing impedance in real time.
+road network topology (nc_road_graph.pkl), ingests vehicle telemetry from TWO
+interchangeable sources (a real Traccar Client mobile app feed, or a built-in
+simulator that cycles a hardcoded coordinate sequence), computes spoilage-risk-
+optimized routes against a fixed destination hub, and accepts crowd-sourced driver
+ground-truth reports that override routing impedance in real time.
 
 Run standalone (this is a real server, not an in-process mock):
     uv run live_backend.py
 
 Serves on http://127.0.0.1:8000
+
+Traccar Client (Android/iOS "Traccar Client" app) should be pointed at:
+    http://<this-machine-ip>:8000/v1/telematics/incoming
+using its generic "OsmAnd" / query-string protocol, which sends telemetry as
+GET query parameters (id, lat, lon, timestamp, speed, bearing, ...).
 """
 
 from __future__ import annotations
@@ -18,14 +25,13 @@ import logging
 import pickle
 import threading
 import time
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, Optional
 
 import networkx as nx
 import numpy as np
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from scipy.spatial import cKDTree
@@ -36,22 +42,25 @@ import nc_road_network as ncr
 # Configuration
 # ---------------------------------------------------------------------------
 GRAPH_PATH = Path("nc_road_graph.pkl")
-HOST = "127.0.0.1"
+HOST = "0.0.0.0"  # 0.0.0.0 so a phone on the same network can reach /v1/telematics/incoming
 PORT = 8000
 
 VEHICLE_ID = "TRUCK-01"
 DESTINATION_NAME = "Upington"
 
 # Port Nolloth heading inland on the N7, then east on the N14 toward Upington.
-# The sequence loops continuously so a live dashboard has something to watch
-# indefinitely rather than stalling after one pass.
-GPS_TELEMETRY_SEQUENCE: list[tuple[float, float]] = [
+# Used only by the SIMULATOR feed. Loops continuously so a live dashboard has
+# something to watch indefinitely rather than stalling after one pass.
+SIMULATOR_SEQUENCE: list[tuple[float, float]] = [
     (16.8667, -29.2500),   # Port Nolloth
     (17.8865, -29.6644),   # Springbok
     (19.4000, -29.1333),   # approaching Pofadder
     (21.1500, -29.3333),   # approaching Kenhardt
     (21.2561, -28.4478),   # Upington
 ]
+
+FEED_SOURCE_REAL = "REAL-TIME TRACCAR HARDWARE"
+FEED_SOURCE_SIMULATED = "SIMULATED TELEMETRY MATRIX"
 
 # Documented, not fitted, roughness assumptions per reported road condition.
 # Matches the roughness-multiplier scale established in nc_road_network.py.
@@ -85,23 +94,30 @@ class FieldReport(BaseModel):
     actual_speed: float = Field(..., gt=0.0, le=160.0)
 
 
-@dataclass
-class VehicleState:
-    step: int = 0
-    latitude: float = GPS_TELEMETRY_SEQUENCE[0][1]
-    longitude: float = GPS_TELEMETRY_SEQUENCE[0][0]
-    cargo_temp_c: float = 3.5
-    timestamp: int = 0
-
-
-vehicle_state = VehicleState()
+# ---------------------------------------------------------------------------
+# In-memory tracking state — single source of truth for whichever feed is
+# currently driving the vehicle's position. Both ingestion endpoints write
+# into this same dict, so the dashboard never needs to know which feed is
+# active beyond reading `feed_source`.
+# ---------------------------------------------------------------------------
+tracking_state: dict = {
+    "vehicle_id": VEHICLE_ID,
+    "lat": SIMULATOR_SEQUENCE[0][1],
+    "lon": SIMULATOR_SEQUENCE[0][0],
+    "timestamp": int(time.time()),
+    "cargo_temp_c": 3.5,
+    "feed_source": FEED_SOURCE_SIMULATED,
+    "speed_kmh": 0.0,
+    "bearing": 0.0,
+}
+simulator_step = 0
 active_driver_reports: dict[tuple[int, int], dict] = {}
 
 
 # ---------------------------------------------------------------------------
 # Topology loading and impedance matrix initialization
 # ---------------------------------------------------------------------------
-def load_topology() -> tuple[nx.Graph, dict[int, tuple[float, float]]]:
+def load_topology() -> tuple[nx.Graph, set, dict[int, tuple[float, float]]]:
     if not GRAPH_PATH.exists():
         raise FileNotFoundError(
             f"'{GRAPH_PATH}' not found. Run Data_Audit.ipynb first to produce it, "
@@ -109,7 +125,7 @@ def load_topology() -> tuple[nx.Graph, dict[int, tuple[float, float]]]:
         )
     with GRAPH_PATH.open("rb") as f:
         artifacts = pickle.load(f)
-    return artifacts["G_main"], artifacts["cluster_coord"]
+    return artifacts["G_main"], artifacts["main_nodes"], artifacts["cluster_coord"]
 
 
 def initialize_baseline_impedance(topology: nx.Graph) -> None:
@@ -158,7 +174,7 @@ def baseline_weight(u: int, v: int, edge_attrs: dict) -> float:
 # ---------------------------------------------------------------------------
 class NodeSpatialIndex:
     """Nearest-neighbor snapping of raw GPS coordinates onto the closest node
-    in main_nodes / the active routable topology."""
+    in main_nodes / the active routable topology (G_main)."""
 
     def __init__(self, topology: nx.Graph, cluster_coord: dict[int, tuple[float, float]]):
         self._node_ids: list[int] = list(topology.nodes())
@@ -170,6 +186,7 @@ class NodeSpatialIndex:
         self._tree = cKDTree(projected)
 
     def snap(self, latitude: float, longitude: float) -> tuple[int, float]:
+        """Returns (node_id, distance_km)."""
         query_point = np.array([longitude * self._mx, latitude * self._my])
         distance_m, index = self._tree.query(query_point)
         return self._node_ids[int(index)], float(distance_m) / 1000.0
@@ -206,7 +223,7 @@ class EdgeSpatialIndex:
 # Startup: load topology, build indices, resolve destination
 # ---------------------------------------------------------------------------
 logger.info("Loading network topology from %s", GRAPH_PATH)
-live_topology, cluster_coord = load_topology()
+live_topology, main_nodes, cluster_coord = load_topology()
 initialize_baseline_impedance(live_topology)
 logger.info(
     "Topology ready: %d nodes, %d edges, spoilage_cost impedance initialized",
@@ -226,10 +243,8 @@ logger.info(
 
 app = FastAPI(title="Northern Cape Fleet Telemetry and Routing API")
 
-# CORS: the dispatch map now polls this API directly from client-side JS running
-# inside a components.html iframe (srcdoc origin), instead of via Streamlit's
-# Python process. Without this, the browser blocks the fetch() calls entirely.
-# Wide open on purpose since this only ever binds to 127.0.0.1 for local/demo use.
+# CORS: the dashboard's map/JS components fetch this API directly from the browser.
+# Wide open on purpose since this only ever binds for local/demo/hackathon use.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -246,41 +261,147 @@ def health_check() -> dict:
     return {"status": "online", "service": "Northern Cape Fleet Telemetry and Routing API"}
 
 
-@app.get("/v1/telematics/truck-01")
-def get_telematics() -> dict:
+@app.api_route("/v1/telematics/incoming", methods=["GET", "POST"])
+async def telematics_incoming(request: Request) -> dict:
+    """
+    Real-hardware ingestion endpoint. Point Traccar Client's server URL at
+        http://<this-machine-ip>:8000/v1/telematics/incoming
+    and it will call this endpoint on every GPS fix with `id`, `lat`, `lon`,
+    `timestamp`, `speed`, `bearing`.
+
+    Traccar Client's exact wire format varies by version/configuration: some
+    send everything as URL query-string parameters (works with GET or POST),
+    others send a POST with the same fields as a form-urlencoded body. This
+    endpoint checks the query string first, then falls back to a parsed
+    form body, so either mode works without reconfiguring the phone.
+
+    Overwrites the in-memory tracking state, marks the feed source as real
+    hardware, and snaps the raw phone coordinates onto the G_main topology.
+    """
+    params: dict[str, str] = dict(request.query_params)
+
+    if request.method == "POST":
+        content_type = request.headers.get("content-type", "")
+        if "application/x-www-form-urlencoded" in content_type or "multipart/form-data" in content_type:
+            try:
+                form = await request.form()
+                for key, value in form.items():
+                    params.setdefault(key, str(value))
+            except Exception as exc:
+                logger.warning("TRACCAR INGEST -> could not parse POST body: %s", exc)
+
+    device_id = params.get("id")
+    raw_lat = params.get("lat")
+    raw_lon = params.get("lon")
+    timestamp = params.get("timestamp")
+    raw_speed = params.get("speed")
+    raw_bearing = params.get("bearing")
+
+    if raw_lat is None or raw_lon is None:
+        logger.error(
+            "TRACCAR INGEST -> missing lat/lon. method=%s content_type=%s received_keys=%s",
+            request.method, request.headers.get("content-type"), list(params.keys()),
+        )
+        raise HTTPException(
+            status_code=422,
+            detail=f"Missing lat/lon. Received fields: {list(params.keys())}",
+        )
+
+    try:
+        lat = float(raw_lat)
+        lon = float(raw_lon)
+        speed = float(raw_speed) if raw_speed not in (None, "") else None
+        bearing = float(raw_bearing) if raw_bearing not in (None, "") else None
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=f"Could not parse numeric field: {exc}") from exc
+
+    try:
+        snapped_node_id, snap_distance_km = node_index.snap(lat, lon)
+    except Exception as exc:
+        logger.error("TRACCAR INGEST -> snapping failed: %s", exc)
+        raise HTTPException(status_code=500, detail=f"Snapping failed: {exc}") from exc
+
     with state_lock:
-        sequence_length = len(GPS_TELEMETRY_SEQUENCE)
-        lap_position = vehicle_state.step % sequence_length
-        longitude, latitude = GPS_TELEMETRY_SEQUENCE[lap_position]
-
-        vehicle_state.latitude = latitude
-        vehicle_state.longitude = longitude
-        vehicle_state.cargo_temp_c = round(3.5 + 0.35 * lap_position, 2)
-        vehicle_state.timestamp = int(time.time())
-        vehicle_state.step += 1
-
-        payload = {
-            "vehicle_id": VEHICLE_ID,
-            "lat": vehicle_state.latitude,
-            "lon": vehicle_state.longitude,
-            "timestamp": vehicle_state.timestamp,
-            "cargo_temp_c": vehicle_state.cargo_temp_c,
-            "step": vehicle_state.step,
-        }
+        tracking_state["vehicle_id"] = device_id or VEHICLE_ID
+        tracking_state["lat"] = lat
+        tracking_state["lon"] = lon
+        tracking_state["timestamp"] = int(time.time())
+        tracking_state["feed_source"] = FEED_SOURCE_REAL
+        tracking_state["speed_kmh"] = speed if speed is not None else tracking_state.get("speed_kmh", 0.0)
+        tracking_state["bearing"] = bearing if bearing is not None else tracking_state.get("bearing", 0.0)
+        # cargo temperature isn't reported by the phone hardware feed; hold the
+        # last known value steady rather than fabricating a new one.
 
     logger.info(
-        "TELEMATICS -> vehicle=%s lat=%.4f lon=%.4f cargo_temp_c=%.2f step=%d",
-        payload["vehicle_id"], payload["lat"], payload["lon"],
-        payload["cargo_temp_c"], payload["step"],
+        "TRACCAR INGEST -> device_id=%s lat=%.5f lon=%.5f speed=%s bearing=%s "
+        "snapped_node_id=%s snap_distance_km=%.3f",
+        device_id, lat, lon, speed, bearing, snapped_node_id, snap_distance_km,
+    )
+    return {
+        "status": "received",
+        "feed_source": FEED_SOURCE_REAL,
+        "snapped_node_id": snapped_node_id,
+        "snap_distance_km": round(snap_distance_km, 3),
+    }
+
+
+@app.post("/v1/telematics/simulate-step")
+def telematics_simulate_step() -> dict:
+    """
+    Fallback demo feed. Advances one step through a hardcoded 5-point sequence
+    along a real Northern Cape transport lane (Port Nolloth -> Upington),
+    looping continuously. Called by the dashboard on every polling tick when
+    Simulator Mode is active.
+    """
+    global simulator_step
+    with state_lock:
+        sequence_length = len(SIMULATOR_SEQUENCE)
+        lap_position = simulator_step % sequence_length
+        longitude, latitude = SIMULATOR_SEQUENCE[lap_position]
+
+        tracking_state["vehicle_id"] = VEHICLE_ID
+        tracking_state["lat"] = latitude
+        tracking_state["lon"] = longitude
+        tracking_state["timestamp"] = int(time.time())
+        tracking_state["cargo_temp_c"] = round(3.5 + 0.35 * lap_position, 2)
+        tracking_state["feed_source"] = FEED_SOURCE_SIMULATED
+        tracking_state["speed_kmh"] = 80.0
+        tracking_state["bearing"] = 0.0
+        simulator_step += 1
+
+        payload = dict(tracking_state)
+        payload["step"] = simulator_step
+
+    logger.info(
+        "SIMULATOR STEP -> lap_position=%d lat=%.4f lon=%.4f cargo_temp_c=%.2f",
+        lap_position, latitude, latitude, payload["cargo_temp_c"],
+    )
+    return payload
+
+
+@app.get("/v1/telematics/truck-01")
+def get_telematics() -> dict:
+    """Returns the unified active tracking state, regardless of which feed
+    (real hardware or simulator) most recently wrote to it."""
+    with state_lock:
+        payload = dict(tracking_state)
+
+    logger.info(
+        "TELEMATICS -> vehicle=%s lat=%.4f lon=%.4f feed_source=%s",
+        payload["vehicle_id"], payload["lat"], payload["lon"], payload["feed_source"],
     )
     return payload
 
 
 @app.get("/v1/routing/truck-01")
 def get_routing() -> dict:
+    """Dynamically reads whichever location is currently active in memory
+    (real or simulated) as the moving origin, and computes the optimal
+    spoilage_cost path to the fixed destination hub."""
     with state_lock:
-        current_lat = vehicle_state.latitude
-        current_lon = vehicle_state.longitude
+        current_lat = tracking_state["lat"]
+        current_lon = tracking_state["lon"]
+        feed_source = tracking_state["feed_source"]
 
     try:
         current_node, snap_distance_km = node_index.snap(current_lat, current_lon)
@@ -317,13 +438,15 @@ def get_routing() -> dict:
     coordinates = [[cluster_coord[node_id][0], cluster_coord[node_id][1]] for node_id in live_path]
 
     logger.info(
-        "ROUTING -> current_node=%s hops=%d total_time_mins=%.2f total_spoilage_cost=%.3f "
-        "detour_active=%s",
-        current_node, len(live_path) - 1, total_time_mins, total_spoilage_cost, detour_active,
+        "ROUTING -> feed_source=%s current_node=%s hops=%d total_time_mins=%.2f "
+        "total_spoilage_cost=%.3f detour_active=%s",
+        feed_source, current_node, len(live_path) - 1, total_time_mins,
+        total_spoilage_cost, detour_active,
     )
 
     return {
         "vehicle_id": VEHICLE_ID,
+        "feed_source": feed_source,
         "snapped_node_id": current_node,
         "snap_distance_km": round(snap_distance_km, 3),
         "destination_node_id": DESTINATION_NODE,
@@ -337,6 +460,9 @@ def get_routing() -> dict:
 
 @app.post("/v1/reports/submit")
 def submit_report(report: FieldReport) -> dict:
+    """Driver/fisherman ground-truth submission. Snaps the reported fix onto
+    the nearest road segment and overrides that segment's spoilage_cost,
+    triggering an immediate reroute on the next /v1/routing/truck-01 call."""
     try:
         matched_u, matched_v, distance_km = edge_index.snap(report.lat, report.lon)
     except Exception as exc:
