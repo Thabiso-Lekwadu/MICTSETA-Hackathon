@@ -19,7 +19,7 @@ from scipy.spatial import cKDTree
 GEOD = Geod(ellps="WGS84")
 
 # ---------------------------------------------------------------------------
-# Domain knowledge tables — documented assumptions, not fitted values.
+# Domain knowledge tables, documented assumptions, not fitted values.
 # ---------------------------------------------------------------------------
 DEFAULT_SPEED_KMH = {
     "trunk": 100, "trunk_link": 60,
@@ -55,7 +55,7 @@ TOWNS = {
     "De Aar": (24.0129, -30.6497), "Calvinia": (19.7761, -31.4707),
     "Port Nolloth": (16.8667, -29.2500),
 }
-# Approximate — the extract's bbox edge is close to the border, so this snaps
+# Approximate, the extract's bbox edge is close to the border, so this snaps
 # ~9-10km from the true crossing. Good enough at province scale; a production
 # version should fetch the real point via Overpass (barrier=border_control).
 BORDER_POSTS = {
