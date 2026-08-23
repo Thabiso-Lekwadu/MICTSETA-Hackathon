@@ -19,7 +19,7 @@ from scipy.spatial import cKDTree
 GEOD = Geod(ellps="WGS84")
 
 # ---------------------------------------------------------------------------
-# Domain knowledge tables — documented assumptions, not fitted values.
+# Domain knowledge tables, documented assumptions, not fitted values.
 # ---------------------------------------------------------------------------
 DEFAULT_SPEED_KMH = {
     "trunk": 100, "trunk_link": 60,
@@ -46,7 +46,19 @@ ROUGHNESS_MULTIPLIER = {
 EXCLUDE_FCLASS = ["residential", "service", "footway", "path", "steps",
                    "pedestrian", "cycleway", "bridleway"]
 
-SNAP_TOLERANCE_M = 25         # merge endpoints within this distance into one node
+SNAP_TOLERANCE_M = 150        # merge endpoints within this distance into one node
+# Widened from the original 25m: at 25m the largest connected component covers
+# only ~26% of the network (14,830 disconnected islands total), which forces
+# routing onto huge, geographically nonsensical detours whenever the real
+# connector between two points falls into a separate island. 150m closes most
+# of that fragmentation. Going wider (300m+) closes more of it but starts
+# producing IMPOSSIBLE routes shorter than the straight-line distance between
+# their endpoints — i.e. it starts falsely merging nodes that aren't actually
+# the same junction (parallel carriageways, nearby-but-unconnected roads).
+# 150m was chosen because, checked against every town pair in TOWNS, it never
+# produces a route shorter than straight-line distance; wider tolerances did.
+# Use validate_route_plausibility() / flag_implausible_pairs() below to check
+# any remaining gaps rather than pushing this value higher.
 SIMPLIFY_TOLERANCE_DEG = 0.0005  # ~55m; cuts vertex count without changing topology
 
 TOWNS = {
@@ -55,7 +67,7 @@ TOWNS = {
     "De Aar": (24.0129, -30.6497), "Calvinia": (19.7761, -31.4707),
     "Port Nolloth": (16.8667, -29.2500),
 }
-# Approximate — the extract's bbox edge is close to the border, so this snaps
+# Approximate, the extract's bbox edge is close to the border, so this snaps
 # ~9-10km from the true crossing. Good enough at province scale; a production
 # version should fetch the real point via Overpass (barrier=border_control).
 BORDER_POSTS = {
@@ -94,21 +106,21 @@ def impute_maxspeed(gdf, min_group_n=10, min_fclass_n=30, min_parent_n=5, speed_
     (division by zero, or roads that look infinitely fast). This replaces every 0/missing
     value using the most specific real signal available, falling back progressively:
 
-      Level 0  observed          — a real, non-zero maxspeed value. Trusted as-is.
-      Level 1  fclass_ref_median — median of real values sharing the same (fclass, ref
+      Level 0  observed          : a real, non-zero maxspeed value. Trusted as-is.
+      Level 1  fclass_ref_median : median of real values sharing the same (fclass, ref
                                     prefix), e.g. ("primary", "R") for provincial R-roads.
                                     Used only where >= min_group_n real samples exist.
-      Level 2  fclass_median     — median of real values for the fclass alone, used only
+      Level 2  fclass_median     : median of real values for the fclass alone, used only
                                     where >= min_fclass_n real samples exist.
-      Level 3  parent_class      — borrows from a related class: *_link classes fall back
+      Level 3  parent_class      : borrows from a related class: *_link classes fall back
                                     to their base class (trunk_link -> trunk); track_gradeN
                                     classes fall back to the combined median across all
                                     track* grades. Used only where the parent itself has
                                     >= min_parent_n real samples.
-      Level 4  domain_default    — a documented, not-fitted assumption table based on
+      Level 4  domain_default    : a documented, not-fitted assumption table based on
                                     typical South African road design speeds. Last resort.
 
-    Every row keeps a `speed_source` label recording which tier it came from — this is
+    Every row keeps a `speed_source` label recording which tier it came from, this is
     what makes the imputation auditable rather than a black box.
     """
     df = gdf.copy()
@@ -118,7 +130,7 @@ def impute_maxspeed(gdf, min_group_n=10, min_fclass_n=30, min_parent_n=5, speed_
     df["imputed_speed_kmh"] = df["maxspeed_valid"]
     df["speed_source"] = np.where(df["maxspeed_valid"].notna(), "observed", pd.NA)
 
-    # Level 1 — (fclass, ref_prefix) group median
+    # Level 1: (fclass, ref_prefix) group median
     grp1 = df.groupby(["fclass", "ref_prefix"])["maxspeed_valid"].agg(["median", "count"])
     for (fclass, ref_prefix), row in grp1.iterrows():
         if row["count"] >= min_group_n:
@@ -127,7 +139,7 @@ def impute_maxspeed(gdf, min_group_n=10, min_fclass_n=30, min_parent_n=5, speed_
             df.loc[mask, "imputed_speed_kmh"] = row["median"]
             df.loc[mask, "speed_source"] = "fclass_ref_median"
 
-    # Level 2 — fclass-only median (computed from ALL real observations for that fclass,
+    # Level 2: fclass-only median (computed from ALL real observations for that fclass,
     # not just what's left unfilled, so the sample size check is against the true support)
     grp2 = df.groupby("fclass")["maxspeed_valid"].agg(["median", "count"])
     for fclass, row in grp2.iterrows():
@@ -136,9 +148,9 @@ def impute_maxspeed(gdf, min_group_n=10, min_fclass_n=30, min_parent_n=5, speed_
             df.loc[mask, "imputed_speed_kmh"] = row["median"]
             df.loc[mask, "speed_source"] = "fclass_median"
 
-    # Level 3 — parent-class borrowing. Deliberately excludes track_gradeN: real samples
+    # Level 3: parent-class borrowing. Deliberately excludes track_gradeN: real samples
     # per grade are too sparse (2-33 observations) and noisy to trust a combined "all
-    # track grades" average — that would erase the whole point of grading (a maintained
+    # track grades" average, that would erase the whole point of grading (a maintained
     # grade1 track and a barely-passable grade5 track would wrongly get the same speed).
     # Ungraded *_link classes reasonably do share their parent's character, so those still
     # borrow; track_gradeN instead falls through to the grade-differentiated domain
@@ -158,12 +170,12 @@ def impute_maxspeed(gdf, min_group_n=10, min_fclass_n=30, min_parent_n=5, speed_
             df.loc[mask, "imputed_speed_kmh"] = value
             df.loc[mask, "speed_source"] = "parent_class_median"
 
-    # Level 4 — documented domain-default table (last resort)
+    # Level 4: documented domain-default table (last resort)
     mask = df["imputed_speed_kmh"].isna()
     df.loc[mask, "imputed_speed_kmh"] = df.loc[mask, "fclass"].map(DEFAULT_SPEED_KMH).fillna(40)
     df.loc[mask, "speed_source"] = "domain_default"
 
-    # A vehicle cannot travel at ~0 km/h even in principle — floor any residual extreme
+    # A vehicle cannot travel at ~0 km/h even in principle, floor any residual extreme
     # low value (e.g. a genuine but implausible observed maxspeed=2 on one segment).
     df["imputed_speed_kmh"] = df["imputed_speed_kmh"].clip(lower=speed_floor_kmh)
 
@@ -175,7 +187,7 @@ def clean_and_enrich(gdf, exclude_fclass=EXCLUDE_FCLASS,
     gdf = gdf[~gdf["fclass"].isin(exclude_fclass)].copy()
     gdf["geometry"] = gdf.geometry.simplify(tolerance=simplify_tol, preserve_topology=True)
 
-    # accurate geodesic length — avoids UTM-zone distortion across the province
+    # accurate geodesic length, avoids UTM-zone distortion across the province
     gdf["length_km"] = gdf.geometry.apply(lambda g: GEOD.geometry_length(g) / 1000)
 
     # tiered maxspeed imputation (see impute_maxspeed docstring for the method)
@@ -205,7 +217,7 @@ def build_graph(gdf, snap_tol_m=SNAP_TOLERANCE_M):
 
     node_list = list(raw_nodes)
     mean_lat = np.mean([n[1] for n in node_list])
-    mx = 111320 * np.cos(np.radians(mean_lat))
+    mx = 111320 * np.cos(np.radians(mean_lat)) # convert the lon/lat degree coordinates to meters for snapping
     my = 110540
     pts_m = np.array([[n[0] * mx, n[1] * my] for n in node_list])
 
@@ -273,7 +285,7 @@ def projection_scale(mean_lat):
 
 
 # ---------------------------------------------------------------------------
-# Routing — weight functions and Standard vs Fisheries-Optimized comparison
+# Routing: weight functions and Standard vs Fisheries-Optimized comparison
 # ---------------------------------------------------------------------------
 def make_time_weight(border_nodes):
     def weight_fn(u, v, d):
@@ -322,6 +334,81 @@ def compare_routes(G, origin_node, destination_node, border_nodes,
     standard["path"] = standard_path
     optimized["path"] = optimized_path
     return standard, optimized
+
+
+# ---------------------------------------------------------------------------
+# Route plausibility validation — a route can never be shorter than the
+# straight-line (great-circle) distance between its endpoints. A ratio close
+# to 1.0 for a long haul is a red flag in the opposite direction: it usually
+# means two genuinely different roads got falsely merged into one node by
+# graph-building's snap tolerance. A high ratio (default threshold 1.6x)
+# usually means the real, direct connector is missing/disconnected from the
+# main routable component, forcing a detour like the Kimberley->De Aar case
+# this was built to catch. Use this after any change to SNAP_TOLERANCE_M, and
+# before picking town pairs for a live demo.
+# ---------------------------------------------------------------------------
+def straight_line_km(lon1, lat1, lon2, lat2):
+    _, _, distance_m = GEOD.inv(lon1, lat1, lon2, lat2)
+    return distance_m / 1000.0
+
+
+def validate_route_plausibility(G, cluster_coord, origin_node, destination_node,
+                                 origin_lonlat=None, destination_lonlat=None, max_ratio=1.6):
+    """Runs the time-shortest path between two already-resolved graph nodes
+    and compares its distance against the straight-line distance between
+    their real-world coordinates (origin_lonlat/destination_lonlat — falls
+    back to the node's own snapped coordinate if not supplied, e.g. for a
+    town whose true location differs slightly from its nearest graph node)."""
+    path = nx.shortest_path(G, origin_node, destination_node, weight='travel_time')
+    route_km = sum(G[u][v]['length_km'] for u, v in zip(path[:-1], path[1:]))
+    route_hr = sum(G[u][v]['travel_time'] for u, v in zip(path[:-1], path[1:]))
+
+    o_lon, o_lat = origin_lonlat if origin_lonlat else cluster_coord[origin_node]
+    d_lon, d_lat = destination_lonlat if destination_lonlat else cluster_coord[destination_node]
+    straight_km = straight_line_km(o_lon, o_lat, d_lon, d_lat)
+
+    ratio = route_km / straight_km if straight_km > 0 else float('inf')
+    return {
+        "route_km": round(route_km, 1),
+        "route_time_hr": round(route_hr, 2),
+        "straight_line_km": round(straight_km, 1),
+        "ratio": round(ratio, 2),
+        # impossible: no real road can be shorter than the straight line.
+        # Signals a false merge (snap tolerance too wide), not a real gap.
+        "impossible_shortcut": ratio < 1.0,
+        # plausible-but-suspicious detour, most likely a missing connector.
+        "flagged_as_detour": ratio >= max_ratio,
+    }
+
+
+def flag_implausible_pairs(G, cluster_coord, towns=TOWNS, max_ratio=1.6):
+    """Runs validate_route_plausibility() across every pair in `towns` (or any
+    {name: (lon, lat)} dict) and returns one row per pair. Intended for a
+    quick sanity-check cell in Data_Audit.ipynb — run this any time the graph
+    is rebuilt, and treat any 'impossible_shortcut' row as urgent (the graph
+    is falsely connecting two different roads) and any 'flagged_as_detour'
+    row as a candidate to avoid for a live demo until investigated."""
+    import itertools
+
+    def nearest_node(lon, lat):
+        best, best_dist = None, float('inf')
+        for node in G.nodes():
+            clon, clat = cluster_coord[node]
+            dist = (clon - lon) ** 2 + (clat - lat) ** 2
+            if dist < best_dist:
+                best_dist = dist
+                best = node
+        return best
+
+    node_lookup = {name: nearest_node(lon, lat) for name, (lon, lat) in towns.items()}
+    rows = []
+    for a, b in itertools.combinations(towns.keys(), 2):
+        result = validate_route_plausibility(
+            G, cluster_coord, node_lookup[a], node_lookup[b],
+            origin_lonlat=towns[a], destination_lonlat=towns[b], max_ratio=max_ratio,
+        )
+        rows.append({"origin": a, "destination": b, **result})
+    return rows
 
 
 # ---------------------------------------------------------------------------

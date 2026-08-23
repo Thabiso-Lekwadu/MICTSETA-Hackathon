@@ -271,7 +271,18 @@ def render_live_map(initial_routing: dict | None, initial_telematics: dict) -> N
     <div id="fleet-map"></div>
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     <script>
-      const BACKEND = window.location.protocol + '//' + window.location.hostname + ':8000';
+      // Use the same backend URL the Python side already talks to
+      // successfully, instead of re-deriving it from window.location.
+      // Guessing it from the browser's own protocol/hostname breaks as
+      // soon as the dashboard is served from anywhere other than
+      // exactly "http://<same-host>:8000" (a tunnel, a different LAN
+      // IP, HTTPS, etc.) — the fetch then silently fails and the truck
+      // marker never receives new coordinates, even though the
+      // server-side polling (which isn't subject to browser CORS/
+      // mixed-content rules) keeps working and the metric numbers keep
+      // updating. That mismatch is exactly what caused the icon to sit
+      // still while the coordinates kept changing.
+      const BACKEND = {json.dumps(BACKEND_URL)};
       const OPTIMIZED_COLOR = '{OPTIMIZED_COLOR}';
       const STANDARD_COLOR = '{STANDARD_COLOR}';
       const POLL_MS = {int(POLL_INTERVAL_SECONDS * 1000)};
@@ -337,13 +348,13 @@ def render_live_map(initial_routing: dict | None, initial_telematics: dict) -> N
             destMarker.setLatLng([destCoords[1], destCoords[0]]);
             destMarker.setTooltipContent('Destination: ' + (data.destination_town || ''));
           }}
-        }} catch (e) {{ /* backend momentarily unreachable — keep last known route */ }}
+        }} catch (e) {{ console.warn('pollRouting failed:', e); }}
       }}
 
       async function pollTelemetry() {{
         try {{
           const res = await fetch(BACKEND + '/v1/telematics/truck-01');
-          if (!res.ok) return;
+          if (!res.ok) {{ console.warn('pollTelemetry non-OK response:', res.status); return; }}
           const data = await res.json();
           if (data.lat == null || data.lon == null) return;
           truckMarker.setLatLng([data.lat, data.lon]);
@@ -351,7 +362,7 @@ def render_live_map(initial_routing: dict | None, initial_telematics: dict) -> N
             (data.vehicle_id || 'Vehicle') + ' | ' + data.lat.toFixed(5) + ', ' + data.lon.toFixed(5) +
             ' | ' + (data.feed_source || '')
           );
-        }} catch (e) {{ /* backend momentarily unreachable — keep last known position */ }}
+        }} catch (e) {{ console.warn('pollTelemetry failed:', e); }}
       }}
 
       setInterval(pollTelemetry, POLL_MS);

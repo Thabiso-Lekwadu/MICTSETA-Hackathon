@@ -46,7 +46,19 @@ ROUGHNESS_MULTIPLIER = {
 EXCLUDE_FCLASS = ["residential", "service", "footway", "path", "steps",
                    "pedestrian", "cycleway", "bridleway"]
 
-SNAP_TOLERANCE_M = 25         # merge endpoints within this distance into one node
+SNAP_TOLERANCE_M = 150        # merge endpoints within this distance into one node
+# Widened from the original 25m: at 25m the largest connected component covers
+# only ~26% of the network (14,830 disconnected islands total), which forces
+# routing onto huge, geographically nonsensical detours whenever the real
+# connector between two points falls into a separate island. 150m closes most
+# of that fragmentation. Going wider (300m+) closes more of it but starts
+# producing IMPOSSIBLE routes shorter than the straight-line distance between
+# their endpoints — i.e. it starts falsely merging nodes that aren't actually
+# the same junction (parallel carriageways, nearby-but-unconnected roads).
+# 150m was chosen because, checked against every town pair in TOWNS, it never
+# produces a route shorter than straight-line distance; wider tolerances did.
+# Use validate_route_plausibility() / flag_implausible_pairs() below to check
+# any remaining gaps rather than pushing this value higher.
 SIMPLIFY_TOLERANCE_DEG = 0.0005  # ~55m; cuts vertex count without changing topology
 
 TOWNS = {
@@ -322,6 +334,81 @@ def compare_routes(G, origin_node, destination_node, border_nodes,
     standard["path"] = standard_path
     optimized["path"] = optimized_path
     return standard, optimized
+
+
+# ---------------------------------------------------------------------------
+# Route plausibility validation — a route can never be shorter than the
+# straight-line (great-circle) distance between its endpoints. A ratio close
+# to 1.0 for a long haul is a red flag in the opposite direction: it usually
+# means two genuinely different roads got falsely merged into one node by
+# graph-building's snap tolerance. A high ratio (default threshold 1.6x)
+# usually means the real, direct connector is missing/disconnected from the
+# main routable component, forcing a detour like the Kimberley->De Aar case
+# this was built to catch. Use this after any change to SNAP_TOLERANCE_M, and
+# before picking town pairs for a live demo.
+# ---------------------------------------------------------------------------
+def straight_line_km(lon1, lat1, lon2, lat2):
+    _, _, distance_m = GEOD.inv(lon1, lat1, lon2, lat2)
+    return distance_m / 1000.0
+
+
+def validate_route_plausibility(G, cluster_coord, origin_node, destination_node,
+                                 origin_lonlat=None, destination_lonlat=None, max_ratio=1.6):
+    """Runs the time-shortest path between two already-resolved graph nodes
+    and compares its distance against the straight-line distance between
+    their real-world coordinates (origin_lonlat/destination_lonlat — falls
+    back to the node's own snapped coordinate if not supplied, e.g. for a
+    town whose true location differs slightly from its nearest graph node)."""
+    path = nx.shortest_path(G, origin_node, destination_node, weight='travel_time')
+    route_km = sum(G[u][v]['length_km'] for u, v in zip(path[:-1], path[1:]))
+    route_hr = sum(G[u][v]['travel_time'] for u, v in zip(path[:-1], path[1:]))
+
+    o_lon, o_lat = origin_lonlat if origin_lonlat else cluster_coord[origin_node]
+    d_lon, d_lat = destination_lonlat if destination_lonlat else cluster_coord[destination_node]
+    straight_km = straight_line_km(o_lon, o_lat, d_lon, d_lat)
+
+    ratio = route_km / straight_km if straight_km > 0 else float('inf')
+    return {
+        "route_km": round(route_km, 1),
+        "route_time_hr": round(route_hr, 2),
+        "straight_line_km": round(straight_km, 1),
+        "ratio": round(ratio, 2),
+        # impossible: no real road can be shorter than the straight line.
+        # Signals a false merge (snap tolerance too wide), not a real gap.
+        "impossible_shortcut": ratio < 1.0,
+        # plausible-but-suspicious detour, most likely a missing connector.
+        "flagged_as_detour": ratio >= max_ratio,
+    }
+
+
+def flag_implausible_pairs(G, cluster_coord, towns=TOWNS, max_ratio=1.6):
+    """Runs validate_route_plausibility() across every pair in `towns` (or any
+    {name: (lon, lat)} dict) and returns one row per pair. Intended for a
+    quick sanity-check cell in Data_Audit.ipynb — run this any time the graph
+    is rebuilt, and treat any 'impossible_shortcut' row as urgent (the graph
+    is falsely connecting two different roads) and any 'flagged_as_detour'
+    row as a candidate to avoid for a live demo until investigated."""
+    import itertools
+
+    def nearest_node(lon, lat):
+        best, best_dist = None, float('inf')
+        for node in G.nodes():
+            clon, clat = cluster_coord[node]
+            dist = (clon - lon) ** 2 + (clat - lat) ** 2
+            if dist < best_dist:
+                best_dist = dist
+                best = node
+        return best
+
+    node_lookup = {name: nearest_node(lon, lat) for name, (lon, lat) in towns.items()}
+    rows = []
+    for a, b in itertools.combinations(towns.keys(), 2):
+        result = validate_route_plausibility(
+            G, cluster_coord, node_lookup[a], node_lookup[b],
+            origin_lonlat=towns[a], destination_lonlat=towns[b], max_ratio=max_ratio,
+        )
+        rows.append({"origin": a, "destination": b, **result})
+    return rows
 
 
 # ---------------------------------------------------------------------------

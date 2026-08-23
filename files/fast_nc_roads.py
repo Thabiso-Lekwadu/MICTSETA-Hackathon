@@ -13,7 +13,7 @@ def extract_northern_cape_roads():
 
     # 2. Download zip with a standard browser User-Agent (Bypasses bot-blocking)
     if not os.path.exists(local_zip) or not zipfile.is_zipfile(local_zip):
-        print("📥 Downloading South Africa road data archive from Geofabrik...")
+        print("Downloading South Africa road data archive from Geofabrik...")
 
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
         response = requests.get(url, headers=headers, stream=True)
