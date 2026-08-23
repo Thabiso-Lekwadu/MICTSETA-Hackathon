@@ -1,0 +1,74 @@
+[build-system]
+requires = [
+    "setuptools",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+requires-python = ">=3.10"
+name = "nc_freight_optimizer"
+readme = "README.md"
+dynamic = [
+    "version",
+]
+dependencies = [
+    "ipython>=8.10",
+    "jupyterlab>=3.0",
+    "notebook",
+    "kedro~=1.5.0",
+    "kedro-datasets[pandas,pickle]",
+    "geopandas",
+    "networkx",
+    "numpy",
+    "pandas",
+    "pyproj",
+    "scipy",
+    "fastapi",
+    "uvicorn",
+    "pydantic",
+    "streamlit",
+    "streamlit-folium",
+    "folium",
+    "requests",
+]
+
+[project.scripts]
+nc-freight-optimizer = "nc_freight_optimizer.__main__:main"
+
+[project.entry-points."kedro.hooks"]
+
+[project.optional-dependencies]
+dev = [
+    "pytest-cov>=3,<7",
+    "pytest-mock>=1.7.1, <2.0",
+    "pytest~=7.2",
+    "ruff~=0.12.0",
+]
+
+[tool.setuptools.dynamic.version]
+attr = "nc_freight_optimizer.__version__"
+
+[tool.setuptools.packages.find]
+where = [
+    "src",
+]
+namespaces = false
+
+[tool.kedro]
+package_name = "nc_freight_optimizer"
+project_name = "nc_freight_optimizer"
+kedro_init_version = "1.5.0"
+tools = "['Testing', 'Data Structure']"
+example_pipeline = "False"
+source_dir = "src"
+
+[tool.pytest.ini_options]
+addopts = "--cov-report term-missing --cov src/nc_freight_optimizer -ra"
+
+[tool.coverage.report]
+fail_under = 0
+show_missing = true
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+]

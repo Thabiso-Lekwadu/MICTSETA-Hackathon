@@ -1,0 +1,87 @@
+# Domain parameters for the road_network and route_reporting pipelines.
+# These are documented assumptions where the raw OSM extract had no usable data
+# (see docs/data_audit_findings.md) -- not fitted coefficients.
+
+road_network:
+  expected_bbox:
+    min_lon: 16.45
+    max_lon: 25.30
+    min_lat: -31.85
+    max_lat: -24.60
+  # 1.0 degree tolerance, not the tighter 0.5 you might expect: the raw extract was
+  # clipped with a rectangular bounding box, not the true (irregular) provincial
+  # polygon, so it legitimately bleeds a little into North West Province near the
+  # northern corner (observed max_lat ~-24.10, about 0.5 deg north of the nominal
+  # provincial extent). This is a genuine property of the source data, not an error
+  # to mask -- see docs/data_audit_findings.md.
+  bbox_tolerance_deg: 1.0
+
+  # Non-drivable / irrelevant classes for province-scale freight routing.
+  exclude_fclass:
+    - residential
+    - service
+    - footway
+    - path
+    - steps
+    - pedestrian
+    - cycleway
+    - bridleway
+
+  # Douglas-Peucker geometry simplification tolerance, in degrees (~55m).
+  simplify_tolerance_deg: 0.0005
+
+  # Endpoint-snapping tolerance for graph topology construction, in metres.
+  snap_tolerance_m: 25
+
+  # Tiered maxspeed imputation last-resort defaults, by OSM fclass (km/h).
+  default_speed_kmh:
+    trunk: 100
+    trunk_link: 60
+    primary: 100
+    primary_link: 60
+    secondary: 80
+    secondary_link: 50
+    tertiary: 60
+    tertiary_link: 40
+    unclassified: 50
+    living_street: 20
+    track_grade1: 40
+    track_grade2: 30
+    track_grade3: 25
+    track_grade4: 20
+    track_grade5: 15
+    track: 30
+
+  # Relative vibration / cold-chain-damage risk multiplier, by fclass.
+  roughness_multiplier:
+    trunk: 1.00
+    trunk_link: 1.00
+    primary: 1.05
+    primary_link: 1.05
+    secondary: 1.10
+    secondary_link: 1.10
+    tertiary: 1.15
+    tertiary_link: 1.15
+    unclassified: 1.30
+    living_street: 1.20
+    track_grade1: 1.40
+    track_grade2: 1.60
+    track_grade3: 1.90
+    track_grade4: 2.20
+    track_grade5: 2.60
+    track: 2.00
+
+routing:
+  towns:
+    Kimberley: [24.7499, -28.7282]
+    Upington: [21.2561, -28.4478]
+    Springbok: [17.8865, -29.6644]
+    Kuruman: [23.4333, -27.4531]
+    De Aar: [24.0129, -30.6497]
+    Calvinia: [19.7761, -31.4707]
+    Port Nolloth: [16.8667, -29.2500]
+
+  border_posts:
+    Vioolsdrift: [17.7500, -28.7500]
+
+  border_delay_hr: 5.0
