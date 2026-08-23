@@ -70,7 +70,7 @@ def extract_northern_cape_roads():
                     os.rmdir(os.path.join(root, name))
             os.rmdir(extract_dir)
 
-        print("🎉 Success! Your spatial road dataset is complete.")
+        print("Success! The spatial road dataset is complete.")
 
     except Exception as e:
         print(f"Operation failed: {e}")
