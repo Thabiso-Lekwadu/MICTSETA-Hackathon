@@ -33,7 +33,9 @@ data/02_intermediate/  validated + cleaned/enriched road table
 data/03_primary/       the routable graph artifacts, incl. nc_road_graph.pkl (what the live backend loads)
 data/08_reporting/      route_sensitivity_scan.csv -- the batch route-comparison report
 docs/                   architecture notes and data audit findings
-notebooks/              exploratory notebooks (historical, superseded by the pipeline -- see note inside each)
+notebooks/              historical exploratory notebooks -- not runnable as-is (no
+                         old files shipped alongside them); kept as a readable record
+                         of the analysis that shaped the pipeline's design
 src/nc_freight_optimizer/
   road_network_core.py  pure data-cleaning functions (imputation, graph construction)
   routing.py             spatial indices + route-scoring, shared by the pipeline and the live backend
@@ -60,10 +62,13 @@ or with conda: `conda env create -f environment.yml`
 kedro run
 ```
 
-Regenerates everything under `data/02_intermediate/`, `data/03_primary/`, and
-`data/08_reporting/` from the raw extract in `data/01_raw/`. Takes about 10 seconds.
-Run `kedro test` to run the pytest suite (17 tests, including a full pipeline
-execution test).
+Fully automated, no manually-placed files: this downloads the raw OSM extract
+directly from Geofabrik, validates it, clips it to the Northern Cape, cleans and
+enriches it, builds the routable graph, and produces the sensitivity report --
+all from a single command, given internet access. Takes a few minutes (the
+Geofabrik download is the slow part; everything after it is seconds). Run
+`kedro test` to run the pytest suite (17 tests). Note: the end-to-end pipeline
+test requires internet access, since it now genuinely exercises the download step.
 
 ## Running the live demo
 
@@ -94,3 +99,12 @@ Springbok) as "Impassable / Washed Out" in the Driver Ground-Truth Form.
 feed support: real Traccar Client hardware GPS alongside the built-in simulator).
 The versions in this repo are integrated and smoke-tested against the real graph,
 but expect them to keep changing.
+
+## No pre-built data ships with this project
+
+`data/` is genuinely empty (aside from `.gitkeep` placeholders) until you run
+`kedro run`. This is deliberate: the pipeline has zero dependency on any
+manually-placed or previously recovered file. Before your first demo, run
+`kedro run` once, with real internet access, well ahead of time -- the Geofabrik
+download is the slow part (a couple of minutes) and Geofabrik occasionally
+rate-limits automated requests, so don't leave this until you're on stage.

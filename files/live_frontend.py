@@ -129,10 +129,10 @@ def backend_get(path: str, silent: bool = False) -> dict | None:
         return None
 
 
-def backend_post(path: str, json_body: dict | None = None) -> dict | None:
+def backend_post(path: str, json_body: dict | None = None, timeout: float = REQUEST_TIMEOUT_SECONDS) -> dict | None:
     response = None
     try:
-        response = requests.post(f"{BACKEND_URL}{path}", json=json_body, timeout=REQUEST_TIMEOUT_SECONDS)
+        response = requests.post(f"{BACKEND_URL}{path}", json=json_body, timeout=timeout)
         response.raise_for_status()
         return response.json()
     except requests.exceptions.ConnectionError:
@@ -166,6 +166,8 @@ if "telemetry_mode" not in st.session_state:
     st.session_state.telemetry_mode = MODE_SIMULATOR
 if "last_config" not in st.session_state:
     st.session_state.last_config = None
+if "temp_history" not in st.session_state:
+    st.session_state.temp_history = []  # list of {"poll": int, "cargo_temp_c": float} for the live chart
 
 towns_payload = backend_get("/v1/towns", silent=True)
 AVAILABLE_TOWNS = towns_payload["towns"] if towns_payload else []
@@ -214,6 +216,7 @@ else:
             if result is not None:
                 st.session_state.trip_configured = True
                 st.session_state.last_config = {"origin": origin_town, "destination": destination_town}
+                st.session_state.temp_history = []
                 st.rerun()
     else:
         destination_town = st.sidebar.selectbox("Destination", options=AVAILABLE_TOWNS, index=0)
@@ -230,7 +233,33 @@ else:
             if result is not None:
                 st.session_state.trip_configured = True
                 st.session_state.last_config = {"origin": None, "destination": destination_town}
+                st.session_state.temp_history = []
                 st.rerun()
+
+st.sidebar.divider()
+st.sidebar.subheader("Cargo Safety Thresholds")
+st.sidebar.caption(
+    "Set this from your own cold-chain domain knowledge (species, packaging, "
+    "ice quality) — it overrides the system default immediately, no restart needed."
+)
+if "safe_temp_max_c" not in st.session_state:
+    current_thresholds = backend_get("/v1/settings/thresholds", silent=True)
+    st.session_state.safe_temp_max_c = (
+        current_thresholds.get("safe_temp_max_c", 4.0) if current_thresholds else 4.0
+    )
+safe_temp_input = st.sidebar.number_input(
+    "Safe Cargo Temp Max (°C)",
+    min_value=-20.0,
+    max_value=25.0,
+    value=float(st.session_state.safe_temp_max_c),
+    step=0.5,
+    help="Above this temperature, thermal spoilage risk accrues faster than baseline.",
+)
+if st.sidebar.button("Apply Threshold", use_container_width=True):
+    result = backend_post("/v1/settings/thresholds", {"safe_temp_max_c": safe_temp_input})
+    if result is not None:
+        st.session_state.safe_temp_max_c = result["safe_temp_max_c"]
+        st.sidebar.success(f"Safe threshold updated to {result['safe_temp_max_c']:.1f} °C")
 
 st.sidebar.divider()
 st.sidebar.caption(f"Backend: {BACKEND_URL}")
@@ -305,7 +334,7 @@ def render_live_map(initial_routing: dict | None, initial_telematics: dict) -> N
         layerGroup.clearLayers();
         segments.forEach(function(seg) {{
           const coords = seg.coords.map(function(c) {{ return [c[1], c[0]]; }});
-          const label = (seg.road_label || 'Road') + (seg.overridden ? ' (driver-reported condition)' : '') + ' (' + routeLabel + ')';
+          const label = (seg.road_name || 'Road') + (seg.overridden ? ' (driver-reported condition)' : '') + ' (' + routeLabel + ')';
           L.polyline(coords, {{
             color: color, weight: dashed ? 4 : 5, opacity: dashed ? 0.6 : 0.9,
             dashArray: dashed ? '6,6' : null
@@ -413,6 +442,85 @@ with tab_dispatch:
                 unsafe_allow_html=True,
             )
 
+        # --- Embedded AI Cognitive Strategy Layer ---------------------------
+        # Sits directly beneath the live map. Purely on-demand: it never
+        # fires automatically and never touches the polling fragment below,
+        # so it can't add latency or flicker to the live map/metrics. The
+        # first click is slow (the local model loads then); every click
+        # after that is fast, since the backend caches it in memory.
+        st.markdown("---")
+        st.subheader("Embedded AI Cognitive Strategy Layer")
+
+        strategy_routing = backend_get("/v1/routing/truck-01", silent=True)
+        strategy_telematics = backend_get("/v1/telematics/truck-01", silent=True)
+
+        if strategy_routing is None or strategy_routing.get("trip_plan") is None:
+            st.caption("Trip plan unavailable yet — start a trip to generate a strategy report.")
+        else:
+            st.caption(
+                "Sends this trip's fixed planning KPIs to a locally hosted Qwen2.5-1.5B model "
+                "and returns a business-strategy memo. Runs entirely on-box; the first report "
+                "may take a minute or two while the model loads."
+            )
+            if st.button("Generate AI Business Strategy Report", use_container_width=True):
+                trip_plan = strategy_routing["trip_plan"]
+                plan_bv = trip_plan["business_value"]
+                optimized_route = trip_plan["optimized_route"]
+
+                # The road classes (fclass) actually present along the
+                # optimized route, for the wear-and-tear discussion.
+                surface_classes = sorted({
+                    (seg.get("fclass") or "unknown") for seg in optimized_route.get("segments", [])
+                })
+                surface_profile = ", ".join(surface_classes) if surface_classes else "unknown"
+
+                mechanical_risk_reduction_pct = (
+                    plan_bv["standard_spoilage_risk_pct"] - plan_bv["optimized_spoilage_risk_pct"]
+                )
+                thermal_risk_pct = (strategy_telematics or {}).get("thermal_risk_pct", 0.0)
+                cargo_temp_status = (strategy_telematics or {}).get("cargo_temp_status", "Unknown")
+
+                strategy_payload = {
+                    "origin": trip_plan.get("origin_town") or "Current live position",
+                    "destination": trip_plan.get("destination_town", ""),
+                    "standard_time_mins": trip_plan["standard_route"]["total_time_mins"],
+                    "optimized_time_mins": optimized_route["total_time_mins"],
+                    "rand_saved": plan_bv["rand_saved"],
+                    "mechanical_risk_reduction_pct": round(mechanical_risk_reduction_pct, 1),
+                    "thermal_risk_pct": thermal_risk_pct,
+                    "cargo_temp_status": cargo_temp_status,
+                    "surface_profile": surface_profile,
+                    "shipment_value_rand": plan_bv["shipment_value_rand"],
+                }
+
+                logger.info(
+                    "AI STRATEGY REQUEST -> dispatching trip-plan metrics to backend: %s",
+                    strategy_payload,
+                )
+
+                # CPU inference on a 1.5B model generating up to 700 tokens took
+                # ~3m12s in testing — 180s wasn't enough headroom and cut it off
+                # right before it finished. Generous margin here on purpose.
+                STRATEGY_TIMEOUT_SECONDS = 600
+                with st.spinner("🤖 Local model compiling econometric recommendations... (typically 2-4 minutes on CPU)"):
+                    strategy_result = backend_post(
+                        "/v1/analytics/strategy", json_body=strategy_payload, timeout=STRATEGY_TIMEOUT_SECONDS
+                    )
+
+                if strategy_result is not None:
+                    if strategy_result.get("status") == "success":
+                        st.markdown(strategy_result["strategy_markdown"])
+                        logger.info(
+                            "AI STRATEGY REPORT -> received %d characters from model '%s'",
+                            len(strategy_result["strategy_markdown"]), strategy_result.get("model", "?"),
+                        )
+                    else:
+                        st.error(strategy_result.get("message", "AI strategy generation failed."))
+                        logger.warning(
+                            "AI STRATEGY REPORT -> backend returned error_type=%s",
+                            strategy_result.get("error_type"),
+                        )
+
         st.divider()
 
         @st.fragment(run_every=POLL_INTERVAL_SECONDS)
@@ -427,21 +535,116 @@ with tab_dispatch:
             feed_source = telematics.get("feed_source", "UNKNOWN")
             arrived = telematics.get("arrived", False)
             progress_pct = telematics.get("trip_progress_pct")
+            cargo_temp_c = telematics.get("cargo_temp_c", 0.0)
+            temp_status = telematics.get("cargo_temp_status", "Unknown")
 
-            # --- Business value panel -----------------------------------
+            # --- Trip Plan: fixed full-journey baseline, cached once when the
+            # trip was configured. Doesn't change as the truck drives — that's
+            # the point, it's what "Live Remaining" below is measured against.
+            trip_plan = routing.get("trip_plan") if routing is not None else None
+            if trip_plan is not None:
+                st.subheader("Trip Plan (fixed at departure)")
+                plan_bv = trip_plan["business_value"]
+                plan_cols = st.columns(3)
+                plan_cols[0].metric(
+                    "Planned ETA (optimized)", f"{trip_plan['optimized_route']['total_time_mins']:.0f} min"
+                )
+                plan_cols[1].metric("Time Cost vs Standard", f"{-plan_bv['time_saved_mins']:+.0f} min")
+                plan_cols[2].metric(
+                    "Planned Spoilage Risk Avoided",
+                    f"{plan_bv['standard_spoilage_risk_pct'] - plan_bv['optimized_spoilage_risk_pct']:.1f} pts",
+                )
+                st.divider()
+
+            # --- Live Remaining: recomputed from the truck's CURRENT position
+            # on every poll — this is what used to be frozen at the full-trip
+            # value all the way through the drive; it now genuinely shrinks.
             if routing is not None:
                 bv = routing["business_value"]
                 optimized = routing["optimized_route"]
 
-                st.subheader("Business Value")
+                st.subheader("Live Remaining Route")
                 value_cols = st.columns(2)
-                value_cols[0].metric("Optimized ETA", f"{optimized['total_time_mins']:.0f} min")
+                value_cols[0].metric("Remaining ETA (optimized)", f"{optimized['total_time_mins']:.0f} min")
                 value_cols[1].metric(
-                    "Spoilage Risk Avoided",
+                    "Remaining Spoilage Risk Avoided",
                     f"{bv['standard_spoilage_risk_pct'] - bv['optimized_spoilage_risk_pct']:.1f} pts",
                     help=f"Optimized: {bv['optimized_spoilage_risk_pct']:.1f}% risk vs "
-                         f"Standard: {bv['standard_spoilage_risk_pct']:.1f}% risk of shipment value.",
+                         f"Standard: {bv['standard_spoilage_risk_pct']:.1f}% risk, for the route "
+                         f"from where the truck is right now to the destination.",
                 )
+
+            st.divider()
+
+            # --- Cargo Condition: what's actually happening to the shipment,
+            # driven by cargo_temp_c (mechanical risk = road damage already
+            # driven over; thermal risk = temperature exposure accumulated so
+            # far). Replace cargo_temp_c's source with a real reefer sensor
+            # feed via /v1/telematics/incoming once hardware is wired up —
+            # everything downstream of that one number already works.
+            st.subheader("Cargo Condition")
+            cargo_cols = st.columns(4)
+            cargo_cols[0].metric("Cargo Temperature", f"{cargo_temp_c:.1f} C")
+            mech_risk = telematics.get("mechanical_risk_pct")
+            cargo_cols[1].metric(
+                "Mechanical Risk (roads so far)",
+                f"{mech_risk:.1f}%" if mech_risk is not None else "n/a",
+                help="Road-roughness damage accrued on the distance already driven. "
+                     "Only tracked in Simulator mode, which has a fixed planned route.",
+            )
+            cargo_cols[2].metric(
+                "Thermal Risk (heat so far)",
+                f"{telematics.get('thermal_risk_pct', 0):.1f}%",
+                help="Temperature-exposure damage accrued so far, integrated over elapsed time.",
+            )
+            cargo_cols[3].metric(
+                "Value at Risk So Far",
+                f"R {telematics.get('expected_loss_rand_so_far', 0):,.0f}",
+                help="Composite (mechanical + thermal) risk applied to the shipment value.",
+            )
+
+            if temp_status == "Critical":
+                st.error(
+                    f"Cargo temperature CRITICAL at {cargo_temp_c:.1f} C — thermal spoilage risk is "
+                    f"accelerating (composite risk {telematics.get('composite_cargo_risk_pct', 0):.1f}%)."
+                )
+            elif temp_status == "Elevated":
+                st.warning(
+                    f"Cargo temperature elevated at {cargo_temp_c:.1f} C — above the "
+                    f"{st.session_state.safe_temp_max_c:.1f} C safe threshold, "
+                    f"spoilage risk is accruing faster than baseline."
+                )
+            else:
+                st.success(f"Cargo temperature nominal at {cargo_temp_c:.1f} C.")
+
+            # --- Live temperature history chart -----------------------------
+            # Only appends while the trip is still moving. Without this check
+            # it kept appending a fresh point every 2s forever — including
+            # long after arrival — so the chart never settled and kept
+            # redrawing/scrolling even though nothing was actually changing.
+            if not arrived:
+                st.session_state.temp_history.append({
+                    "poll": len(st.session_state.temp_history),
+                    "Cargo Temp (C)": cargo_temp_c,
+                })
+                st.session_state.temp_history = st.session_state.temp_history[-200:]  # cap buffer length
+
+            if len(st.session_state.temp_history) >= 2:
+                chart_data = {
+                    row["poll"]: row["Cargo Temp (C)"] for row in st.session_state.temp_history
+                }
+                st.line_chart(chart_data, height=180)
+                if arrived:
+                    st.caption(
+                        f"🏁 Trip complete — cargo temperature history frozen at arrival "
+                        f"(safe threshold: {st.session_state.safe_temp_max_c:.1f} C)."
+                    )
+                else:
+                    st.caption(
+                        f"Live cargo temperature over the session "
+                        f"(safe threshold: {st.session_state.safe_temp_max_c:.1f} C). "
+                        "This is exactly where a real reefer-unit sensor feed would plug in."
+                    )
 
             st.divider()
 
@@ -452,7 +655,7 @@ with tab_dispatch:
                 "Current Coordinates",
                 f"{telematics.get('lat', 0):.4f}, {telematics.get('lon', 0):.4f}",
             )
-            metric_cols[2].metric("Cargo Temperature", f"{telematics.get('cargo_temp_c', 0):.1f} C")
+            metric_cols[2].metric("Cargo Temperature", f"{cargo_temp_c:.1f} C")
             if progress_pct is not None:
                 metric_cols[3].metric("Trip Progress", f"{progress_pct:.0f}%")
             elif routing is not None:

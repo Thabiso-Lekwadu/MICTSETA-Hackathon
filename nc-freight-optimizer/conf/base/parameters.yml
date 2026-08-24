@@ -3,6 +3,13 @@
 # (see docs/data_audit_findings.md) -- not fitted coefficients.
 
 road_network:
+  # Direct file URL, not a listing page -- the earlier bug in this project's history
+  # was pointing at the bare geofabrik.de homepage and silently downloading its HTML
+  # instead of the actual archive. download_and_extract_raw_roads() validates the
+  # response Content-Type specifically to catch this class of mistake immediately.
+  geofabrik_url: "https://download.geofabrik.de/africa/south-africa-latest-free.shp.zip"
+  shapefile_prefix: "gis_osm_roads_free_1"
+
   expected_bbox:
     min_lon: 16.45
     max_lon: 25.30

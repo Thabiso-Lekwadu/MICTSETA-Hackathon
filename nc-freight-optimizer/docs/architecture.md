@@ -41,6 +41,9 @@ adapt catalog inputs/parameters to the core functions, not to hold logic themsel
 ## Data flow
 
 ```
+[internet]  Geofabrik south-africa-latest-free.shp.zip
+        |  extract_raw_roads (download, validate, extract shapefile, clip to NC bbox)
+        v
 data/01_raw/extracted_full_roads.pkl
         |  validate_raw_roads (structural/bbox audit)
         v

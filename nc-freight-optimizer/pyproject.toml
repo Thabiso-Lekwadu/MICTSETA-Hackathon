@@ -30,6 +30,9 @@ dependencies = [
     "streamlit-folium",
     "folium",
     "requests",
+    "transformers>=5.15.1",
+    "torch>=2.13.0",
+    "accelerate>=1.14.0",
 ]
 
 [project.scripts]

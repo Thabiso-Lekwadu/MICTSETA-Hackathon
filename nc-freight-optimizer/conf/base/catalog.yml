@@ -15,6 +15,9 @@
 raw_roads:
   type: pickle.PickleDataset
   filepath: data/01_raw/extracted_full_roads.pkl
+  # Produced by extract_raw_roads_node (downloads from Geofabrik) -- no longer a
+  # manually-placed file. Delete this and re-run `kedro run` to confirm it
+  # regenerates from nothing but internet access.
 
 validated_roads:
   type: pickle.PickleDataset

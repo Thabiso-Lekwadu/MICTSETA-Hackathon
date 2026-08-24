@@ -50,6 +50,36 @@ Province near the northern corner (observed max latitude ~-24.10, about 0.5 degr
 north of the nominal Northern Cape extent). `conf/base/parameters.yml` documents
 this with a 1.0 degree validation tolerance rather than silently narrowing it.
 
+## Routing bug found and fixed during live testing
+
+A real, severe bug was found by comparing our computed Kimberley→De Aar route
+against Google Maps: our system produced a 624km/6.0hr route with a 63-hop
+backtrack, versus Google's ~220km/2.5hr direct route.
+
+**Root cause:** `NodeSpatialIndex.snap()` picked the geometrically nearest graph
+node with zero regard for connectivity. De Aar's town-centre coordinate snapped to
+a degree-1 dead-end stub 270m away (a short tertiary spur) instead of a
+well-connected primary-road junction only 420m away -- almost certainly the real
+N12 highway junction. The pathfinder then had to escape that dead end through
+whatever fragile local road happened to connect back, producing a massive detour.
+
+**Fix:** `NodeSpatialIndex` now snaps to the nearest node with degree >= 2 within a
+3km search radius, falling back to nearest-overall only if nothing well-connected
+is nearby. After the fix: 313km/3.9hr, zero meaningful backtracking.
+
+**Honest residual gap:** even pure-distance routing on the fixed graph gives
+~300km vs Google's ~220km (~35% longer). Checked whether the edge-collision-drop
+logic in graph construction was a contributing cause (it drops duplicate edges when
+two real segments snap to the same clustered node pair) -- it only affects 0.53% of
+edges, not enough to explain this gap. The remaining difference is most likely
+genuine incompleteness in the free OSM extract for this specific corridor, which is
+consistent with everything else this audit found (only ~1.6% of segments have real
+speed data; only ~26% of the network forms one connected component even after
+cleaning). This is a real limit of hand-rolling a routable graph from a
+crowd-sourced vector extract with our own topology construction, rather than using
+a production routing engine (Valhalla, OSRM) that ingests the full OSM graph
+including turn restrictions and road hierarchy directly from the PBF.
+
 ## Practical implication for routing demos
 
 Divergence between the "Standard" (time-only) and "Fisheries-Optimized"

@@ -13,6 +13,15 @@ import geopandas as gpd
 import networkx as nx
 
 from nc_freight_optimizer import road_network_core as core
+from nc_freight_optimizer.data_ingestion import download_and_extract_raw_roads
+
+
+def extract_raw_roads(geofabrik_url: str, shapefile_prefix: str, clip_bbox: dict) -> gpd.GeoDataFrame:
+    """The pipeline's true first node: downloads and clips the raw OSM extract
+    from Geofabrik. No manually-placed file, no dependency on previously
+    recovered data -- `kedro run` reproduces data/01_raw/ from nothing, given
+    internet access."""
+    return download_and_extract_raw_roads(geofabrik_url, shapefile_prefix, clip_bbox)
 
 
 def validate_raw_roads(raw_roads: gpd.GeoDataFrame, expected_bbox: dict, bbox_tolerance_deg: float) -> gpd.GeoDataFrame:

@@ -8,6 +8,16 @@ from . import nodes
 def create_pipeline(**kwargs) -> Pipeline:
     return modular_pipeline([
         node(
+            func=nodes.extract_raw_roads,
+            inputs=[
+                "params:road_network.geofabrik_url",
+                "params:road_network.shapefile_prefix",
+                "params:road_network.expected_bbox",
+            ],
+            outputs="raw_roads",
+            name="extract_raw_roads_node",
+        ),
+        node(
             func=nodes.validate_raw_roads,
             inputs=["raw_roads", "params:road_network.expected_bbox", "params:road_network.bbox_tolerance_deg"],
             outputs="validated_roads",

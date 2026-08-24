@@ -20,19 +20,53 @@ from scipy.spatial import cKDTree
 
 class NodeSpatialIndex:
     """Nearest-neighbor snapping of raw GPS coordinates onto the closest node
-    in the active routable topology."""
+    in the active routable topology.
 
-    def __init__(self, topology: nx.Graph, cluster_coord: dict[int, tuple[float, float]]):
+    Snaps to the nearest node with degree >= min_degree, not simply the nearest
+    node overall. A pure nearest-node snap can land on a degree-1 dead-end stub
+    (e.g. a short residential/tertiary spur excluded-adjacent segment) instead of
+    the well-connected trunk/primary junction a few hundred metres further away --
+    confirmed as the root cause of a real routing bug: De Aar's town-centre point
+    snapped to a degree-1 tertiary stub 270m away instead of a degree-2 primary-road
+    junction 420m away, forcing the pathfinder into a ~400km detour to escape the
+    dead end. Preferring degree >= 2 candidates fixes this at the snapping layer,
+    where it belongs, rather than papering over it in the routing logic.
+    """
+
+    def __init__(self, topology: nx.Graph, cluster_coord: dict[int, tuple[float, float]],
+                 min_degree: int = 2, degree_search_radius_km: float = 3.0):
+        self._topology = topology
         self._node_ids: list[int] = list(topology.nodes())
         coordinates = np.array([cluster_coord[node_id] for node_id in self._node_ids])
         mean_latitude = float(coordinates[:, 1].mean())
         self._mx = 111_320.0 * np.cos(np.radians(mean_latitude))
         self._my = 110_540.0
+        self._min_degree = min_degree
+        self._degree_search_radius_m = degree_search_radius_km * 1000
+
         projected = np.column_stack([coordinates[:, 0] * self._mx, coordinates[:, 1] * self._my])
         self._tree = cKDTree(projected)
 
+        # Separate tree over only the well-connected nodes, so a query can ask
+        # "nearest node with degree >= min_degree" directly instead of having to
+        # rank an unbounded candidate list on every snap call.
+        well_connected_mask = np.array([topology.degree(n) >= min_degree for n in self._node_ids])
+        self._well_connected_node_ids = [n for n, keep in zip(self._node_ids, well_connected_mask) if keep]
+        if self._well_connected_node_ids:
+            self._well_connected_tree = cKDTree(projected[well_connected_mask])
+        else:
+            self._well_connected_tree = None
+
     def snap(self, latitude: float, longitude: float) -> tuple[int, float]:
         query_point = np.array([longitude * self._mx, latitude * self._my])
+
+        if self._well_connected_tree is not None:
+            distance_m, index = self._well_connected_tree.query(query_point)
+            if distance_m <= self._degree_search_radius_m:
+                return self._well_connected_node_ids[int(index)], float(distance_m) / 1000.0
+
+        # No well-connected node within the search radius: fall back to the
+        # nearest node overall rather than failing outright.
         distance_m, index = self._tree.query(query_point)
         return self._node_ids[int(index)], float(distance_m) / 1000.0
 
