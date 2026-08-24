@@ -35,6 +35,7 @@ from pydantic import BaseModel, Field
 from scipy.spatial import cKDTree
 
 import nc_road_network as ncr
+import weather_engine
 
 # transformers is an optional dependency: the rest of the dispatch/routing
 # system must keep working (telemetry ingest, driver reports, live map) even
@@ -82,6 +83,31 @@ THERMAL_SPOILAGE_THRESHOLD_HOURS = 24.0  # risk-hours budget before treated as a
 MECHANICAL_RISK_WEIGHT = 0.5     # how road-damage risk and thermal risk are blended into one live figure
 THERMAL_RISK_WEIGHT = 0.5
 
+# --- Ambient-weather-driven idling warm-up model ----------------------------
+# Live ambient temperature (via weather_engine.py / Open-Meteo) scales how
+# fast an IDLING reefer chamber warms up — this models what happens while a
+# real hardware feed has no dedicated cargo-interior sensor of its own yet.
+# Deliberately scoped to HARDWARE mode only (see get_telematics): simulator
+# mode already has its own tested, deterministic temperature curve
+# (simulated_cargo_temp_c) and is left completely untouched by this.
+EXTREME_HEAT_THRESHOLD_C = 38.0
+COLD_CLIMATE_THRESHOLD_C = 20.0
+IDLE_WARMING_TICK_EXTREME_C = 0.4    # °C per tracking tick, ambient >= 38.0°C
+IDLE_WARMING_TICK_STANDARD_C = 0.1   # °C per tracking tick, 20.0°C <= ambient < 38.0°C
+IDLE_WARMING_TICK_COLD_C = 0.02      # °C per tracking tick, ambient < 20.0°C
+# Safety clamp: this is a per-tick idling drift model, not a physical
+# simulation with its own equilibrium point — without a cap, a long idle
+# period at a fast poll rate would run away well past any plausible trailer-
+# interior temperature.
+IDLE_WARMING_MAX_CARGO_TEMP_C = 60.0
+
+# Live ambient weather at the vehicle's current position, refreshed on every
+# /v1/telematics/truck-01 poll (see get_telematics) and read by the AI
+# Strategy Layer and the /v1/routing/weather-profile endpoint. Plain dict
+# read/write (no lock) for the same reason as live_settings above: a handful
+# of GIL-atomic scalar fields, briefly reading mid-update has no consequence.
+CURRENT_WEATHER: dict = {"temp_c": 25.0, "rain_mm": 0.0, "alert": "Normal"}
+
 # Runtime-adjustable business thresholds. Cooperative dispatchers know their
 # own cargo (species, packaging, ice quality) better than any hardcoded
 # constant can — this is read by thermal_rate_multiplier/cargo_temp_status
@@ -94,11 +120,18 @@ live_settings: dict = {
 
 # Documented, not fitted, roughness assumptions per reported road condition.
 # Matches the roughness-multiplier scale established in nc_road_network.py.
+# The last three are storm-specific: active infrastructure failure during
+# severe weather, distinct from routine wear — all pinned to IRI 6.0+ so a
+# storm report always forces an immediate detour on the next reroute, same
+# mechanism as any other driver-reported override.
 ROAD_CONDITION_ROUGHNESS: dict[str, float] = {
     "Smooth Tarmac": 1.0,
     "Corrugated / Rough Gravel": 1.8,
     "Severe Potholes": 2.6,
     "Impassable / Washed Out": 6.0,
+    "Flash Flood Mud Trap": 6.5,
+    "Gravel Bed Erosion": 6.0,
+    "Structural Road Washout": 7.5,
 }
 
 # ---------------------------------------------------------------------------
@@ -124,6 +157,10 @@ AI_STRATEGY_SYSTEM_PROMPT = (
     "     desert tracks versus paved corridors.\n"
     "  2. Thermal risk: temperature-exposure damage from the reefer unit "
     "     running above the safe carry threshold.\n\n"
+    "If live ambient weather figures are provided in the request, factor them "
+    "briefly into your thermal-risk discussion — e.g. extreme heat straining "
+    "the reefer condenser, or heavy rain raising washout risk on unpaved "
+    "segments. If no weather figures are provided, do not mention weather at all.\n\n"
     "Quantify the Rand-value trade-off between any extra travel time and the "
     "spoilage risk avoided by the optimized route.\n\n"
     "Do NOT write a title, a 'Date:' line, or a 'Route:' line — that header is "
@@ -145,6 +182,12 @@ class StrategyRequest(BaseModel):
     cargo_temp_status: str
     surface_profile: str
     shipment_value_rand: float = Field(..., ge=0.0)
+    # Optional and backward-compatible: any existing caller that doesn't
+    # send these still works exactly as before (weather section just gets
+    # omitted from the prompt — see generate_ai_strategy).
+    ambient_temp_c: float | None = None
+    rain_mm: float | None = None
+    weather_alert: str | None = None
 
 
 # Lazily loaded, then cached for the life of the process — loading the model
@@ -227,7 +270,8 @@ class FieldReport(BaseModel):
     lat: float = Field(..., ge=-90.0, le=90.0)
     lon: float = Field(..., ge=-180.0, le=180.0)
     road_condition: Literal[
-        "Smooth Tarmac", "Corrugated / Rough Gravel", "Severe Potholes", "Impassable / Washed Out"
+        "Smooth Tarmac", "Corrugated / Rough Gravel", "Severe Potholes", "Impassable / Washed Out",
+        "Flash Flood Mud Trap", "Gravel Bed Erosion", "Structural Road Washout",
     ]
     actual_speed: float = Field(..., gt=0.0, le=160.0)
 
@@ -755,12 +799,35 @@ def get_telematics() -> dict:
         has no fixed planned route to measure "so far" against).
       - thermal_risk_pct: temperature-exposure damage accrued so far, from
         cargo_temp_c integrated over elapsed time. Simulator mode uses a
-        closed-form integral of the known simulated curve (exact, no drift).
-        Hardware mode accumulates incrementally between polls using whatever
-        the last real (or last-known) cargo_temp_c reading was.
+        closed-form integral of the known simulated curve (exact, no drift,
+        unaffected by live weather — see simulated_cargo_temp_c). Hardware
+        mode accumulates incrementally between polls using whatever the
+        last real (or last-known) cargo_temp_c reading was, and — while
+        idling — drifts that reading itself using live ambient weather (see
+        CURRENT_WEATHER / weather_engine.py) as a stand-in for a real
+        reefer-interior sensor.
     composite_cargo_risk_pct blends the two into one headline number.
     """
+    # Snapshot just the position needed for a weather lookup, then release
+    # the lock before making the (occasionally slow, first-call-per-cache-
+    # window) external weather request — holding state_lock across a
+    # blocking network call would stall every other endpoint's polling.
     with state_lock:
+        snapshot_lat = tracking_state["lat"]
+        snapshot_lon = tracking_state["lon"]
+
+    weather_reading = (
+        weather_engine.get_current_weather(snapshot_lat, snapshot_lon)
+        if snapshot_lat is not None and snapshot_lon is not None
+        else None
+    )
+
+    with state_lock:
+        if weather_reading is not None:
+            CURRENT_WEATHER["temp_c"] = weather_reading["temp_c"]
+            CURRENT_WEATHER["rain_mm"] = weather_reading["rain_mm"]
+            CURRENT_WEATHER["alert"] = weather_reading["alert"]
+
         mechanical_risk_pct: float | None = None
         thermal_risk_pct: float
 
@@ -798,6 +865,26 @@ def get_telematics() -> dict:
                 dt_hours = max(0.0, (now - last_ts) / 3600.0)
                 rate = thermal_rate_multiplier(tracking_state["cargo_temp_c"])
                 trip_state["thermal_risk_accum_hours"] += dt_hours * rate
+
+                # Ambient-weather-driven idling warm-up: while the vehicle is
+                # stopped (e.g. at a border post or loading bay), the cargo
+                # chamber's own reading drifts based on live outside air
+                # temperature — this is what a real cargo sensor would show
+                # once wired up; independent of the thermal-risk accumulation
+                # above, which tracks cumulative spoilage exposure, not the
+                # instantaneous temperature itself.
+                is_idling = tracking_state.get("speed_kmh", 0.0) <= 0.5
+                if is_idling:
+                    ambient_temp_c = CURRENT_WEATHER["temp_c"]
+                    if ambient_temp_c >= EXTREME_HEAT_THRESHOLD_C:
+                        warming_tick_c = IDLE_WARMING_TICK_EXTREME_C
+                    elif ambient_temp_c >= COLD_CLIMATE_THRESHOLD_C:
+                        warming_tick_c = IDLE_WARMING_TICK_STANDARD_C
+                    else:
+                        warming_tick_c = IDLE_WARMING_TICK_COLD_C
+                    tracking_state["cargo_temp_c"] = round(
+                        min(IDLE_WARMING_MAX_CARGO_TEMP_C, tracking_state["cargo_temp_c"] + warming_tick_c), 2
+                    )
             trip_state["last_thermal_update_ts"] = now
 
             thermal_risk_pct = round(
@@ -819,6 +906,7 @@ def get_telematics() -> dict:
         payload["thermal_risk_pct"] = thermal_risk_pct
         payload["composite_cargo_risk_pct"] = composite_cargo_risk_pct
         payload["expected_loss_rand_so_far"] = expected_loss_rand_so_far
+        payload["ambient_weather"] = dict(CURRENT_WEATHER)
 
         if trip_state["configured"] and trip_state["mode"] == "simulator" and trip_state["sim_total_hours"]:
             elapsed_real_s = time.monotonic() - trip_state["trip_start_ts"]
@@ -894,6 +982,92 @@ def get_routing() -> dict:
         "trip_plan": trip_plan,
         # kept for compatibility with older callers expecting a single "path"
         "path": optimized["coordinates"],
+    }
+
+
+@app.get("/v1/routing/weather-profile")
+def get_routing_weather_profile() -> dict:
+    """Samples live ambient weather along the trip.
+
+    Prefers the trip's FIXED full route — Origin/Midpoint/Destination from
+    the actual departure-to-arrival plan, cached once at /v1/trip/configure
+    time — whenever one exists. This is deliberate: sampling the shrinking
+    current-position-to-destination "remaining route" instead (the previous
+    behavior) meant "Origin" silently became wherever the truck currently
+    was, and once little route remained, all three points could collapse
+    onto nearly the same coordinate. The fixed plan never shrinks and never
+    mislabels, so those three rows always mean what they say.
+
+    Falls back to the remaining route only when no fixed plan exists
+    (hardware mode has no known origin town ahead of time, so there's no
+    fixed corridor to sample).
+
+    Always ALSO includes a separate 'Current Position' reading from the
+    vehicle's live coordinates — this is what tracks the truck in real
+    time as it drives, distinct from the fixed route-corridor forecast rows.
+    """
+    with state_lock:
+        if not trip_state["configured"]:
+            raise HTTPException(status_code=409, detail="No trip configured yet. Call /v1/trip/configure first.")
+        destination_node = trip_state["destination_node"]
+        current_lat = tracking_state["lat"]
+        current_lon = tracking_state["lon"]
+        origin_town = trip_state["origin_town"]
+        destination_town = trip_state["destination_town"]
+        trip_plan = trip_state["trip_plan"]
+
+    if current_lat is None or current_lon is None:
+        raise HTTPException(status_code=409, detail="No position available yet.")
+
+    if trip_plan is not None:
+        coordinates = trip_plan["optimized_route"]["coordinates"]
+        route_basis = "fixed_trip_plan"
+    else:
+        origin_node, _snap_km = node_index.snap(current_lat, current_lon)
+        optimized = build_route(origin_node, destination_node, spoilage_weight)
+        coordinates = optimized["coordinates"]
+        route_basis = "remaining_route"
+
+    if len(coordinates) == 1:
+        sample_points = [coordinates[0], coordinates[0], coordinates[0]]
+    else:
+        midpoint_index = len(coordinates) // 2
+        sample_points = [coordinates[0], coordinates[midpoint_index], coordinates[-1]]
+    labels = ["Origin", "Midpoint", "Destination"]
+
+    segments = []
+    for label, (lon, lat) in zip(labels, sample_points):
+        reading = weather_engine.get_current_weather(lat, lon)
+        segments.append({
+            "label": label,
+            "lat": round(lat, 5),
+            "lon": round(lon, 5),
+            "temp_c": reading["temp_c"],
+            "rain_mm": reading["rain_mm"],
+            "alert": reading["alert"],
+            "source": reading["source"],
+        })
+
+    # Live reading at the truck's ACTUAL current position — always reflects
+    # wherever it is right now, distinct from the fixed corridor rows above.
+    # This is the one that visibly moves as the truck drives.
+    current_reading = weather_engine.get_current_weather(current_lat, current_lon)
+    segments.append({
+        "label": "Current Position",
+        "lat": round(current_lat, 5),
+        "lon": round(current_lon, 5),
+        "temp_c": current_reading["temp_c"],
+        "rain_mm": current_reading["rain_mm"],
+        "alert": current_reading["alert"],
+        "source": current_reading["source"],
+    })
+
+    return {
+        "vehicle_id": VEHICLE_ID,
+        "origin_town": origin_town,
+        "destination_town": destination_town,
+        "route_basis": route_basis,
+        "segments": segments,
     }
 
 
@@ -992,6 +1166,15 @@ def generate_ai_strategy(payload: StrategyRequest) -> dict:
         }
 
     time_delta_mins = payload.standard_time_mins - payload.optimized_time_mins
+
+    weather_section = ""
+    if payload.ambient_temp_c is not None:
+        weather_section = (
+            f"- Live ambient temperature at the vehicle's position: {payload.ambient_temp_c:.1f}°C\n"
+            f"- Live rain intensity: {(payload.rain_mm or 0.0):.1f} mm\n"
+            f"- Live weather alert status: {payload.weather_alert or 'Normal'}\n"
+        )
+
     user_prompt = (
         f"FIXED ROUTE FOR THIS MEMO: {payload.origin} -> {payload.destination}\n"
         f"(Use these exact two town names throughout. Do not mention any other "
@@ -1006,6 +1189,7 @@ def generate_ai_strategy(payload: StrategyRequest) -> dict:
         f"- Current thermal (temperature-exposure) risk accrued so far: {payload.thermal_risk_pct:.1f}%\n"
         f"- Current cargo temperature status: {payload.cargo_temp_status}\n"
         f"- Road surface profile along the optimized route: {payload.surface_profile}\n"
+        f"{weather_section}"
         f"- Total shipment value at risk: R {payload.shipment_value_rand:,.0f}\n\n"
         "Using ONLY these figures, produce a strategic business memo for the cooperative's "
         "dispatch manager: quantify the Rand-value trade-off between extra travel time and "

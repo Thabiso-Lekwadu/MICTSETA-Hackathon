@@ -404,7 +404,9 @@ def render_live_map(initial_routing: dict | None, initial_telematics: dict) -> N
 # ---------------------------------------------------------------------------
 # Tabs
 # ---------------------------------------------------------------------------
-tab_dispatch, tab_field_report = st.tabs(["Fleet Dispatch Hub", "Driver Ground-Truth Form"])
+tab_dispatch, tab_field_report, tab_weather = st.tabs(
+    ["🚛 Fleet Dispatch Hub", "📝 Driver Ground-Truth Form", "🌤️ Route Weather Analytics"]
+)
 
 
 # ---------------------------------------------------------------------------
@@ -449,7 +451,7 @@ with tab_dispatch:
         # first click is slow (the local model loads then); every click
         # after that is fast, since the backend caches it in memory.
         st.markdown("---")
-        st.subheader("Embedded AI Cognitive Strategy Layer")
+        st.subheader("🧠 Embedded AI Cognitive Strategy Layer")
 
         strategy_routing = backend_get("/v1/routing/truck-01", silent=True)
         strategy_telematics = backend_get("/v1/telematics/truck-01", silent=True)
@@ -462,7 +464,7 @@ with tab_dispatch:
                 "and returns a business-strategy memo. Runs entirely on-box; the first report "
                 "may take a minute or two while the model loads."
             )
-            if st.button("Generate AI Business Strategy Report", use_container_width=True):
+            if st.button("💡 Generate AI Business Strategy Report", use_container_width=True):
                 trip_plan = strategy_routing["trip_plan"]
                 plan_bv = trip_plan["business_value"]
                 optimized_route = trip_plan["optimized_route"]
@@ -479,6 +481,7 @@ with tab_dispatch:
                 )
                 thermal_risk_pct = (strategy_telematics or {}).get("thermal_risk_pct", 0.0)
                 cargo_temp_status = (strategy_telematics or {}).get("cargo_temp_status", "Unknown")
+                strategy_ambient = (strategy_telematics or {}).get("ambient_weather") or {}
 
                 strategy_payload = {
                     "origin": trip_plan.get("origin_town") or "Current live position",
@@ -491,6 +494,9 @@ with tab_dispatch:
                     "cargo_temp_status": cargo_temp_status,
                     "surface_profile": surface_profile,
                     "shipment_value_rand": plan_bv["shipment_value_rand"],
+                    "ambient_temp_c": strategy_ambient.get("temp_c"),
+                    "rain_mm": strategy_ambient.get("rain_mm"),
+                    "weather_alert": strategy_ambient.get("alert"),
                 }
 
                 logger.info(
@@ -693,6 +699,20 @@ with tab_field_report:
         default_lat = last_telematics.get("lat")
         default_lon = last_telematics.get("lon")
 
+    # Outside the form on purpose: widgets inside st.form don't trigger a
+    # rerun until submit, so a checkbox in there couldn't reveal the storm
+    # dropdown live. Placed here, toggling it reruns the script immediately
+    # and the form below picks up its current value on that same rerun.
+    is_storm_report = st.checkbox(
+        "⛈️ Report Severe Storm / Active Washout Structural Damage",
+        help=(
+            "Use this for active infrastructure failure during severe weather — flash "
+            "flooding, mud traps, washed-out road beds — distinct from routine wear. "
+            "Storm reports are pinned to the highest roughness tier (IRI 6.0+), forcing "
+            "an immediate detour on the dispatch map's next refresh."
+        ),
+    )
+
     with st.form("field_report_form", clear_on_submit=True):
         reporter_role = st.selectbox(
             "Who are you reporting as?",
@@ -719,15 +739,26 @@ with tab_field_report:
             "reporting a different location along the route."
         )
 
-        road_condition = st.selectbox(
-            "Road Condition",
-            options=[
-                "Smooth Tarmac",
-                "Corrugated / Rough Gravel",
-                "Severe Potholes",
-                "Impassable / Washed Out",
-            ],
-        )
+        if is_storm_report:
+            road_condition = st.selectbox(
+                "Storm / Washout Condition",
+                options=[
+                    "Flash Flood Mud Trap",
+                    "Gravel Bed Erosion",
+                    "Structural Road Washout",
+                ],
+                help="Severe, storm-driven infrastructure damage — all three map to IRI 6.0+.",
+            )
+        else:
+            road_condition = st.selectbox(
+                "Road Condition",
+                options=[
+                    "Smooth Tarmac",
+                    "Corrugated / Rough Gravel",
+                    "Severe Potholes",
+                    "Impassable / Washed Out",
+                ],
+            )
 
         actual_speed = st.number_input(
             "Actual speed you're able to travel (km/h)",
@@ -764,3 +795,110 @@ with tab_field_report:
                 "Field report submitted: role=%s condition=%s segment=%s",
                 reporter_role, road_condition, result["matched_segment"],
             )
+
+
+# ---------------------------------------------------------------------------
+# TAB C — Route Weather Analytics (live ambient climate + forecast along path)
+# ---------------------------------------------------------------------------
+with tab_weather:
+    st.title("🌤️ Route Weather Analytics")
+    st.caption(
+        "Live ambient climate data at the vehicle's position and along the active route, "
+        "via the free Open-Meteo API — no API key required."
+    )
+
+    weather_telematics = backend_get("/v1/telematics/truck-01", silent=True)
+    ambient = (weather_telematics or {}).get("ambient_weather") or {
+        "temp_c": 25.0, "rain_mm": 0.0, "alert": "Normal",
+    }
+    ambient_temp_c = ambient.get("temp_c", 25.0)
+
+    if ambient_temp_c >= 38.0:
+        warming_rate_status = "🔥 Accelerated"
+    elif ambient_temp_c < 20.0:
+        warming_rate_status = "🧊 Suppressed"
+    else:
+        warming_rate_status = "➖ Normal"
+
+    st.subheader("Active Vehicle Climate Context")
+    weather_cols = st.columns(3)
+    weather_cols[0].metric("Outside Ambient Temperature", f"{ambient_temp_c:.1f} °C")
+    weather_cols[1].metric("Rain Index", f"{ambient.get('rain_mm', 0.0):.1f} mm")
+    weather_cols[2].metric(
+        "Dynamic Thermodynamic Warming Rate",
+        warming_rate_status,
+        help=(
+            "How fast an IDLING reefer chamber is modeled to warm up right now, driven by "
+            "live ambient temperature: Accelerated ≥38°C, Normal 20-38°C, Suppressed <20°C."
+        ),
+    )
+
+    if ambient.get("alert") == "Extreme Heat":
+        st.error(
+            "🔥 Extreme heat at the vehicle's current position — refrigeration compressor "
+            "under significant thermal stress."
+        )
+    elif ambient.get("alert") == "Heavy Rain / Washout Risk":
+        st.warning(
+            "🌧️ Heavy rain at the vehicle's current position — unpaved segments at "
+            "elevated mud-washout risk."
+        )
+    else:
+        st.success(f"✅ No weather alert at the vehicle's current position ({ambient_temp_c:.1f} °C).")
+
+    st.divider()
+    st.subheader("Road Condition Forecast — Along the Optimized Route")
+    st.caption(
+        "Origin/Midpoint/Destination are fixed to the trip's actual planned route and stay "
+        "put as the truck drives. Current Position is separate and always reflects wherever "
+        "the truck is right now — that's the one that moves."
+    )
+
+    weather_profile = backend_get("/v1/routing/weather-profile", silent=True)
+    if weather_profile is None or not weather_profile.get("segments"):
+        st.info("Start a trip in the Fleet Dispatch Hub to see a weather forecast along the route.")
+    else:
+        forecast_rows = []
+        any_heat_alert = False
+        any_rain_alert = False
+        for seg in weather_profile["segments"]:
+            forecast_rows.append({
+                "Segment": seg["label"],
+                "Latitude": f"{seg['lat']:.4f}",
+                "Longitude": f"{seg['lon']:.4f}",
+                "Temperature (°C)": f"{seg['temp_c']:.1f}",
+                "Rain (mm)": f"{seg['rain_mm']:.1f}",
+                "Alert": seg["alert"],
+            })
+            if seg["alert"] == "Extreme Heat":
+                any_heat_alert = True
+            elif seg["alert"] == "Heavy Rain / Washout Risk":
+                any_rain_alert = True
+
+        st.dataframe(forecast_rows, use_container_width=True, hide_index=True)
+
+        if any_heat_alert:
+            st.error(
+                "🔥 One or more segments ahead report extreme heat — refrigeration "
+                "compressors along this route are under significant strain."
+            )
+        if any_rain_alert:
+            st.warning(
+                "🌧️ One or more segments ahead report heavy rain — unpaved/gravel "
+                "sections at elevated risk of mud washouts."
+            )
+        if not any_heat_alert and not any_rain_alert:
+            st.success("✅ No extreme weather alerts along the route right now.")
+
+        if weather_profile.get("route_basis") == "remaining_route":
+            st.caption(
+                "⚠️ Hardware mode has no fixed origin town, so Origin/Midpoint/Destination "
+                "above are sampled from the truck's current position onward — they will "
+                "converge as it nears the destination. That's expected, not a bug."
+            )
+
+        source_label = weather_profile["segments"][0].get("source", "open-meteo")
+        st.caption(
+            f"Weather data source: {source_label} · via Open-Meteo (no API key required) · "
+            "cached up to 5 minutes per ~1.1km grid cell."
+        )
