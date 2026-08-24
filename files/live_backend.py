@@ -18,6 +18,7 @@ Serves on http://127.0.0.1:8000
 from __future__ import annotations
 
 import logging
+import math
 import pickle
 import re
 import threading
@@ -69,7 +70,7 @@ SIM_TIME_ACCELERATION = 45.0
 
 # Business-value constants (mirrors fisheries_coldchain_optimizer.py)
 SPOILAGE_THRESHOLD = 20.0        # risk-hours budget before treated as total loss
-SHIPMENT_VALUE_RAND = 450_000.0  # full reefer truck of rock lobster, at risk
+SHIPMENT_VALUE_RAND_DEFAULT = 450_000.0  # default only — live value is adjustable at runtime, see live_settings below
 
 # --- Thermal spoilage model -------------------------------------------------
 # Cold-chain spoilage has two genuinely different physical causes, and they're
@@ -90,16 +91,35 @@ THERMAL_RISK_WEIGHT = 0.5
 # Deliberately scoped to HARDWARE mode only (see get_telematics): simulator
 # mode already has its own tested, deterministic temperature curve
 # (simulated_cargo_temp_c) and is left completely untouched by this.
+#
+# Modeled as Newton's-law-of-heating: the cargo temperature exponentially
+# approaches an ambient/threshold-derived equilibrium rather than climbing
+# in a straight line forever. This is deliberate: an unbounded per-poll
+# linear increment has no natural ceiling and doesn't visibly respond to
+# *changes* in conditions the way a real reefer chamber does — it just
+# looks like a counter. An exponential approach genuinely converges, and
+# the equilibrium itself is anchored to the business-adjustable
+# safe_temp_max_c threshold (not just a flat constant), so tightening or
+# loosening that threshold changes this too.
 EXTREME_HEAT_THRESHOLD_C = 38.0
 COLD_CLIMATE_THRESHOLD_C = 20.0
-IDLE_WARMING_TICK_EXTREME_C = 0.4    # °C per tracking tick, ambient >= 38.0°C
-IDLE_WARMING_TICK_STANDARD_C = 0.1   # °C per tracking tick, 20.0°C <= ambient < 38.0°C
-IDLE_WARMING_TICK_COLD_C = 0.02      # °C per tracking tick, ambient < 20.0°C
-# Safety clamp: this is a per-tick idling drift model, not a physical
-# simulation with its own equilibrium point — without a cap, a long idle
-# period at a fast poll rate would run away well past any plausible trailer-
-# interior temperature.
-IDLE_WARMING_MAX_CARGO_TEMP_C = 60.0
+IDLE_WARMING_RATE_EXTREME_PER_HOUR = 2.5    # 1/hr decay constant, ambient >= 38.0°C
+IDLE_WARMING_RATE_STANDARD_PER_HOUR = 0.8   # 1/hr, 20.0°C <= ambient < 38.0°C
+IDLE_WARMING_RATE_COLD_PER_HOUR = 0.2       # 1/hr, ambient < 20.0°C
+IDLE_WARMING_TARGET_OFFSET_EXTREME_C = 10.0   # equilibrium = safe_temp_max_c + this
+IDLE_WARMING_TARGET_OFFSET_STANDARD_C = 4.0
+IDLE_WARMING_TARGET_OFFSET_COLD_C = -1.0      # cold climate: equilibrium sits below threshold
+
+# --- Hardware-mode motion detection -----------------------------------------
+# A hardware trip is "configured" the moment a destination is set, but the
+# truck may still be parked for a while before it actually departs. Cargo
+# risk metrics (thermal accumulation, idling warm-up) are gated behind
+# real detected motion — see hardware_motion_detected in trip_state — so a
+# parked truck doesn't silently accrue spoilage risk against a shipment
+# that hasn't left yet. Motion is detected by displacement from the first
+# post-configure position OR a reported speed, whichever trips first.
+MOTION_DETECTION_DISTANCE_M = 25.0
+MOTION_DETECTION_SPEED_KMH = 1.0
 
 # Live ambient weather at the vehicle's current position, refreshed on every
 # /v1/telematics/truck-01 poll (see get_telematics) and read by the AI
@@ -116,6 +136,7 @@ CURRENT_WEATHER: dict = {"temp_c": 25.0, "rain_mm": 0.0, "alert": "Normal"}
 # and briefly reading a value mid-update has no meaningful consequence.
 live_settings: dict = {
     "safe_temp_max_c": SAFE_TEMP_MAX_C_DEFAULT,
+    "shipment_value_rand": SHIPMENT_VALUE_RAND_DEFAULT,
 }
 
 # Documented, not fitted, roughness assumptions per reported road condition.
@@ -283,10 +304,20 @@ class TripConfig(BaseModel):
 
 
 class ThresholdSettings(BaseModel):
-    # Deliberately loose bounds — this is a business-domain call (species,
-    # packaging, ice quality all shift what "safe" means), not a physics
-    # constant, so the API shouldn't second-guess the dispatcher's number.
-    safe_temp_max_c: float = Field(..., ge=-20.0, le=25.0)
+    # Both fields optional and independently applied (see update_thresholds)
+    # so the sidebar's two "Apply" buttons can each update just their own
+    # setting without having to resend the other one's current value.
+    #
+    # Deliberately loose bounds on safe_temp_max_c — this is a business-
+    # domain call (species, packaging, ice quality all shift what "safe"
+    # means), not a physics constant, so the API shouldn't second-guess the
+    # dispatcher's number.
+    safe_temp_max_c: float | None = Field(None, ge=-20.0, le=25.0)
+    # Business-user-entered value of the shipment, used to convert accrued
+    # spoilage-risk percentages into a Rand figure everywhere that happens
+    # (route business-value comparisons, live expected-loss-so-far). No
+    # sensible physics-based upper bound, so just require it be positive.
+    shipment_value_rand: float | None = Field(None, gt=0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -320,6 +351,12 @@ trip_state: dict = {
     # known closed-form curve fresh each call instead — see integrate_thermal_risk_hours).
     "thermal_risk_accum_hours": 0.0,
     "last_thermal_update_ts": None,
+    # Hardware-mode motion gating — see MOTION_DETECTION_* constants and
+    # telematics_incoming. A parked truck's cargo metrics stay frozen until
+    # this flips True.
+    "hardware_motion_detected": False,
+    "hardware_reference_lat": None,
+    "hardware_reference_lon": None,
 }
 
 active_driver_reports: dict[tuple[int, int], dict] = {}
@@ -372,6 +409,18 @@ def time_weight(u: int, v: int, edge_attrs: dict) -> float:
 def spoilage_weight(u: int, v: int, edge_attrs: dict) -> float:
     """Fisheries-optimized: minimizes cumulative spoilage risk, not time."""
     return effective_spoilage(u, v, edge_attrs)
+
+
+def approx_distance_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Flat-earth equirectangular approximation — plenty accurate for the
+    short displacements (tens of meters) motion detection cares about, and
+    matches the same projection style already used by NodeSpatialIndex."""
+    mean_lat_rad = math.radians((lat1 + lat2) / 2.0)
+    mx = 111_320.0 * math.cos(mean_lat_rad)
+    my = 110_540.0
+    dx = (lon2 - lon1) * mx
+    dy = (lat2 - lat1) * my
+    return math.hypot(dx, dy)
 
 
 # ---------------------------------------------------------------------------
@@ -499,7 +548,7 @@ def build_route(origin_node: int, destination_node: int, weight_fn) -> dict:
         })
 
     spoilage_pct = min(1.0, total_spoilage_cost / SPOILAGE_THRESHOLD)
-    expected_loss_rand = round(spoilage_pct * SHIPMENT_VALUE_RAND, -2)
+    expected_loss_rand = round(spoilage_pct * live_settings["shipment_value_rand"], -2)
 
     return {
         "path_nodes": path,
@@ -650,12 +699,23 @@ def get_thresholds() -> dict:
 
 @app.post("/v1/settings/thresholds")
 def update_thresholds(settings: ThresholdSettings) -> dict:
-    """Updates the safe cargo-temperature threshold immediately — it's read
-    fresh on every thermal-risk calculation (see thermal_rate_multiplier /
-    cargo_temp_status), so this takes effect on the current trip right away,
-    no restart or trip reconfigure needed."""
-    live_settings["safe_temp_max_c"] = settings.safe_temp_max_c
-    logger.info("SETTINGS UPDATED -> safe_temp_max_c=%.1f", settings.safe_temp_max_c)
+    """Updates whichever of the runtime business settings were supplied
+    (each is optional and applied independently — omit a field to leave it
+    unchanged). Both are read fresh wherever they're used — safe_temp_max_c
+    by thermal_rate_multiplier/cargo_temp_status, shipment_value_rand by
+    build_route's expected_loss_rand and get_telematics's
+    expected_loss_rand_so_far — so this takes effect immediately on the
+    current trip, no restart or trip reconfigure needed. A trip's already-
+    cached trip_plan snapshot (see configure_trip) is a deliberate
+    exception: it's frozen at whatever these settings were at configure
+    time, by design, as a stable baseline to compare the live figures
+    against."""
+    if settings.safe_temp_max_c is not None:
+        live_settings["safe_temp_max_c"] = settings.safe_temp_max_c
+        logger.info("SETTINGS UPDATED -> safe_temp_max_c=%.1f", settings.safe_temp_max_c)
+    if settings.shipment_value_rand is not None:
+        live_settings["shipment_value_rand"] = settings.shipment_value_rand
+        logger.info("SETTINGS UPDATED -> shipment_value_rand=%.0f", settings.shipment_value_rand)
     return {"status": "updated", **live_settings}
 
 
@@ -701,7 +761,7 @@ def configure_trip(config: TripConfig) -> dict:
                     "rand_saved": round(standard["expected_loss_rand"] - optimized["expected_loss_rand"], -2),
                     "standard_spoilage_risk_pct": standard["spoilage_risk_pct"],
                     "optimized_spoilage_risk_pct": optimized["spoilage_risk_pct"],
-                    "shipment_value_rand": SHIPMENT_VALUE_RAND,
+                    "shipment_value_rand": live_settings["shipment_value_rand"],
                 },
             }
 
@@ -721,10 +781,23 @@ def configure_trip(config: TripConfig) -> dict:
             trip_state["trip_start_ts"] = None
             trip_state["trip_plan"] = None
             tracking_state["feed_source"] = FEED_SOURCE_REAL
+            # A truck configured for hardware tracking may not have sent a
+            # real position yet, or may still be carrying a stale reading
+            # from a previous simulator trip — start from the same known
+            # baseline the simulator uses, so cargo metrics have a sane
+            # starting point rather than whatever was last in memory.
+            tracking_state["cargo_temp_c"] = simulated_cargo_temp_c(0.0)
+            tracking_state["speed_kmh"] = 0.0
 
         # Reset cargo thermal accumulation for the new trip regardless of mode.
         trip_state["thermal_risk_accum_hours"] = 0.0
         trip_state["last_thermal_update_ts"] = None
+        # Reset hardware motion gating — a freshly configured trip means the
+        # truck hasn't necessarily moved yet, even if it moved during a
+        # previous trip.
+        trip_state["hardware_motion_detected"] = False
+        trip_state["hardware_reference_lat"] = None
+        trip_state["hardware_reference_lon"] = None
 
         trip_state["configured"] = True
 
@@ -780,6 +853,34 @@ async def telematics_incoming(request: Request) -> dict:
         tracking_state["feed_source"] = FEED_SOURCE_REAL
         tracking_state["speed_kmh"] = speed if speed is not None else tracking_state.get("speed_kmh", 0.0)
         tracking_state["bearing"] = bearing if bearing is not None else tracking_state.get("bearing", 0.0)
+
+        # Motion detection for hardware mode: cargo risk metrics stay frozen
+        # (see get_telematics) until the truck has genuinely moved, not just
+        # been configured. The first fix after configure is recorded as a
+        # reference point (the truck sitting still); subsequent fixes are
+        # compared against it — displacement past MOTION_DETECTION_DISTANCE_M,
+        # or a reported speed past MOTION_DETECTION_SPEED_KMH, flips the flag.
+        if trip_state["configured"] and trip_state["mode"] == "hardware" and not trip_state["hardware_motion_detected"]:
+            if trip_state["hardware_reference_lat"] is None:
+                trip_state["hardware_reference_lat"] = lat
+                trip_state["hardware_reference_lon"] = lon
+            else:
+                moved_m = approx_distance_m(
+                    trip_state["hardware_reference_lat"], trip_state["hardware_reference_lon"], lat, lon
+                )
+                speed_trigger = speed is not None and speed >= MOTION_DETECTION_SPEED_KMH
+                if moved_m >= MOTION_DETECTION_DISTANCE_M or speed_trigger:
+                    trip_state["hardware_motion_detected"] = True
+                    # Reset the thermal clock to this exact moment — without
+                    # this, the first accumulation tick after motion starts
+                    # would count all the idle time since configure/last
+                    # poll as if the vehicle had been driving/thermally
+                    # active the whole time.
+                    trip_state["last_thermal_update_ts"] = time.monotonic()
+                    logger.info(
+                        "HARDWARE MOTION DETECTED -> displacement=%.1fm speed=%s km/h — cargo risk tracking begins now.",
+                        moved_m, speed,
+                    )
 
     logger.info("TRACCAR INGEST -> device_id=%s lat=%.5f lon=%.5f", device_id, lat, lon)
     return {"status": "received", "feed_source": FEED_SOURCE_REAL}
@@ -858,33 +959,49 @@ def get_telematics() -> dict:
         else:
             # Hardware mode (or unconfigured): no known future curve to
             # integrate in closed form, so accumulate thermally in real time
-            # between polls using whatever cargo_temp_c is currently known.
+            # between polls using whatever cargo_temp_c is currently known —
+            # but ONLY once the vehicle has genuinely started moving (see
+            # hardware_motion_detected / telematics_incoming). A trip being
+            # "configured" just means a destination was set; the truck can
+            # sit parked for a while before it actually departs, and cargo
+            # risk shouldn't silently accrue against a shipment that hasn't
+            # left yet.
             now = time.monotonic()
             last_ts = trip_state["last_thermal_update_ts"]
-            if last_ts is not None:
+            motion_started = trip_state["hardware_motion_detected"]
+
+            if motion_started and last_ts is not None:
                 dt_hours = max(0.0, (now - last_ts) / 3600.0)
                 rate = thermal_rate_multiplier(tracking_state["cargo_temp_c"])
                 trip_state["thermal_risk_accum_hours"] += dt_hours * rate
 
                 # Ambient-weather-driven idling warm-up: while the vehicle is
-                # stopped (e.g. at a border post or loading bay), the cargo
-                # chamber's own reading drifts based on live outside air
-                # temperature — this is what a real cargo sensor would show
+                # stopped (e.g. at a border post) mid-trip, the cargo chamber
+                # exponentially approaches an equilibrium set by live ambient
+                # temperature AND the adjustable safe-temp threshold — a
+                # real idling reefer drifts toward some ceiling, it doesn't
+                # climb forever. This is what a real cargo sensor would show
                 # once wired up; independent of the thermal-risk accumulation
                 # above, which tracks cumulative spoilage exposure, not the
                 # instantaneous temperature itself.
                 is_idling = tracking_state.get("speed_kmh", 0.0) <= 0.5
-                if is_idling:
+                if is_idling and dt_hours > 0.0:
                     ambient_temp_c = CURRENT_WEATHER["temp_c"]
+                    safe_max_c = live_settings["safe_temp_max_c"]
                     if ambient_temp_c >= EXTREME_HEAT_THRESHOLD_C:
-                        warming_tick_c = IDLE_WARMING_TICK_EXTREME_C
+                        rate_per_hour = IDLE_WARMING_RATE_EXTREME_PER_HOUR
+                        target_c = safe_max_c + IDLE_WARMING_TARGET_OFFSET_EXTREME_C
                     elif ambient_temp_c >= COLD_CLIMATE_THRESHOLD_C:
-                        warming_tick_c = IDLE_WARMING_TICK_STANDARD_C
+                        rate_per_hour = IDLE_WARMING_RATE_STANDARD_PER_HOUR
+                        target_c = safe_max_c + IDLE_WARMING_TARGET_OFFSET_STANDARD_C
                     else:
-                        warming_tick_c = IDLE_WARMING_TICK_COLD_C
-                    tracking_state["cargo_temp_c"] = round(
-                        min(IDLE_WARMING_MAX_CARGO_TEMP_C, tracking_state["cargo_temp_c"] + warming_tick_c), 2
-                    )
+                        rate_per_hour = IDLE_WARMING_RATE_COLD_PER_HOUR
+                        target_c = safe_max_c + IDLE_WARMING_TARGET_OFFSET_COLD_C
+
+                    current_temp = tracking_state["cargo_temp_c"]
+                    decay = math.exp(-rate_per_hour * dt_hours)
+                    tracking_state["cargo_temp_c"] = round(target_c + (current_temp - target_c) * decay, 2)
+
             trip_state["last_thermal_update_ts"] = now
 
             thermal_risk_pct = round(
@@ -898,10 +1015,20 @@ def get_telematics() -> dict:
         else:
             composite_cargo_risk_pct = thermal_risk_pct
 
-        expected_loss_rand_so_far = round(composite_cargo_risk_pct / 100.0 * SHIPMENT_VALUE_RAND, -2)
+        expected_loss_rand_so_far = round(
+            composite_cargo_risk_pct / 100.0 * live_settings["shipment_value_rand"], -2
+        )
 
         payload = dict(tracking_state)
-        payload["cargo_temp_status"] = cargo_temp_status(tracking_state["cargo_temp_c"])
+        awaiting_motion = (
+            trip_state["configured"]
+            and trip_state["mode"] == "hardware"
+            and not trip_state["hardware_motion_detected"]
+        )
+        payload["cargo_temp_status"] = (
+            "Awaiting Motion" if awaiting_motion else cargo_temp_status(tracking_state["cargo_temp_c"])
+        )
+        payload["awaiting_motion"] = awaiting_motion
         payload["mechanical_risk_pct"] = mechanical_risk_pct
         payload["thermal_risk_pct"] = thermal_risk_pct
         payload["composite_cargo_risk_pct"] = composite_cargo_risk_pct
@@ -974,7 +1101,7 @@ def get_routing() -> dict:
             "rand_saved": rand_saved,
             "standard_spoilage_risk_pct": standard["spoilage_risk_pct"],
             "optimized_spoilage_risk_pct": optimized["spoilage_risk_pct"],
-            "shipment_value_rand": SHIPMENT_VALUE_RAND,
+            "shipment_value_rand": live_settings["shipment_value_rand"],
         },
         # Static full-journey reference (simulator mode only) — the fixed
         # planning figures from when the trip was configured, unaffected by

@@ -92,6 +92,25 @@ st.markdown(
         letter-spacing: 0.04em;
         font-size: 0.75rem !important;
     }
+
+    /* --- Kill the "stale element" fade/pulse during fragment reruns ------
+       Streamlit marks every element's wrapper div data-stale="true" for the
+       duration of any script or fragment rerun, and applies an opacity dip
+       + transition to it as a built-in "this is updating" cue (confirmed by
+       inspecting Streamlit's own frontend bundle: stElementContainer sets
+       data-stale from the isStale flag, with opacity:{stale-value} and a
+       transition applied whenever that flag is true). With dispatch_metrics
+       _view() re-running every POLL_INTERVAL_SECONDS via run_every, that
+       cue fires constantly and reads as a continuous pulse/blink across
+       every metric, chart, and alert in the fragment — not a bug in this
+       app's code, just Streamlit's own "updating" indicator running at
+       poll speed. Forcing opacity back to 1 (and killing the transition)
+       on any stale element removes the pulse; the actual data still
+       updates in place exactly as before, just without the fade. */
+    [data-testid="stElementContainer"][data-stale="true"] {
+        opacity: 1 !important;
+        transition: none !important;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -242,10 +261,13 @@ st.sidebar.caption(
     "Set this from your own cold-chain domain knowledge (species, packaging, "
     "ice quality) — it overrides the system default immediately, no restart needed."
 )
-if "safe_temp_max_c" not in st.session_state:
+if "safe_temp_max_c" not in st.session_state or "shipment_value_rand" not in st.session_state:
     current_thresholds = backend_get("/v1/settings/thresholds", silent=True)
     st.session_state.safe_temp_max_c = (
         current_thresholds.get("safe_temp_max_c", 4.0) if current_thresholds else 4.0
+    )
+    st.session_state.shipment_value_rand = (
+        current_thresholds.get("shipment_value_rand", 450_000.0) if current_thresholds else 450_000.0
     )
 safe_temp_input = st.sidebar.number_input(
     "Safe Cargo Temp Max (°C)",
@@ -260,6 +282,28 @@ if st.sidebar.button("Apply Threshold", use_container_width=True):
     if result is not None:
         st.session_state.safe_temp_max_c = result["safe_temp_max_c"]
         st.sidebar.success(f"Safe threshold updated to {result['safe_temp_max_c']:.1f} °C")
+
+st.sidebar.divider()
+st.sidebar.subheader("Shipment Value")
+st.sidebar.caption(
+    "The Rand value of this specific cargo — used to convert accrued spoilage-risk "
+    "percentages into a Rand figure everywhere on the dashboard (route comparisons, "
+    "\"Value at Risk So Far\"). Set this per shipment; it overrides the system default "
+    "immediately, no restart needed."
+)
+shipment_value_input = st.sidebar.number_input(
+    "Shipment Value (R)",
+    min_value=0.01,
+    value=float(st.session_state.shipment_value_rand),
+    step=10_000.0,
+    format="%.0f",
+    help="Full value of the cargo on this truck. Expected-loss figures scale directly with this number.",
+)
+if st.sidebar.button("Apply Shipment Value", use_container_width=True):
+    result = backend_post("/v1/settings/thresholds", {"shipment_value_rand": shipment_value_input})
+    if result is not None:
+        st.session_state.shipment_value_rand = result["shipment_value_rand"]
+        st.sidebar.success(f"Shipment value updated to R {result['shipment_value_rand']:,.0f}")
 
 st.sidebar.divider()
 st.sidebar.caption(f"Backend: {BACKEND_URL}")
@@ -394,8 +438,17 @@ def render_live_map(initial_routing: dict | None, initial_telematics: dict) -> N
         }} catch (e) {{ console.warn('pollTelemetry failed:', e); }}
       }}
 
+      // Routing (the green/grey lines) polls at the SAME cadence as
+      // telemetry (the truck marker), not half as often. /v1/routing/
+      // truck-01 always recomputes the optimized/standard lines fresh from
+      // wherever the truck's CURRENT position snaps to on the road network
+      // — so when this ran at POLL_MS * 2 (half the marker's update rate),
+      // the marker kept advancing every 2s while the line's start point
+      // stayed frozen at a stale position for up to 4s, visibly trailing
+      // off the line until the next routing poll snapped it back into
+      // place. Matching the interval removes that growing/snapping cycle.
       setInterval(pollTelemetry, POLL_MS);
-      setInterval(pollRouting, POLL_MS * 2);
+      setInterval(pollRouting, POLL_MS);
     </script>
     """
     components.html(html, height=540, scrolling=False)
@@ -529,14 +582,61 @@ with tab_dispatch:
 
         st.divider()
 
+        # --- One-time layout scaffold ----------------------------------
+        # Built once per OUTER script run (page load, trip (re)configured,
+        # threshold changed, etc. — all infrequent) and captured by closure
+        # in dispatch_metrics_view() below. The fragment's run_every ticks
+        # only re-execute that inner function, never this scaffold, so it
+        # never calls st.columns()/st.subheader()/st.metric() at the top
+        # level on every poll — it only calls .metric()/.markdown()/etc. on
+        # these SAME placeholder objects. That's the actual fix: calling
+        # st.columns() or st.metric() fresh every ~2s poll rebuilds those
+        # DOM nodes from scratch each cycle, which is what reads as a
+        # blink. Updating an existing placeholder in place just patches its
+        # content, so the layout never flashes. (Deliberately NOT stashed
+        # in session_state — these DeltaGenerator handles are only valid
+        # for this script run, so they're rebuilt fresh, cheaply, every
+        # time this outer code runs, and simply closed over by the fragment.)
+        ui: dict = {"warning": st.empty()}
+
+        ui["plan_wrap"] = st.empty()
+
+        ui["live_header"] = st.empty()
+        live_cols = st.columns(2)
+        ui["live_eta"] = live_cols[0].empty()
+        ui["live_risk"] = live_cols[1].empty()
+        st.divider()
+
+        ui["cargo_header"] = st.empty()
+        cargo_cols = st.columns(4)
+        ui["cargo_temp"] = cargo_cols[0].empty()
+        ui["cargo_mech"] = cargo_cols[1].empty()
+        ui["cargo_thermal"] = cargo_cols[2].empty()
+        ui["cargo_value"] = cargo_cols[3].empty()
+        ui["cargo_alert"] = st.empty()
+
+        ui["chart"] = st.empty()
+        ui["chart_caption"] = st.empty()
+        st.divider()
+
+        tel_cols = st.columns(4)
+        ui["tel_vehicle"] = tel_cols[0].empty()
+        ui["tel_coords"] = tel_cols[1].empty()
+        ui["tel_temp"] = tel_cols[2].empty()
+        ui["tel_fourth"] = tel_cols[3].empty()
+
+        ui["feed"] = st.empty()
+        ui["updated"] = st.empty()
+
         @st.fragment(run_every=POLL_INTERVAL_SECONDS)
         def dispatch_metrics_view():
             telematics = backend_get("/v1/telematics/truck-01", silent=True)
             routing = backend_get("/v1/routing/truck-01", silent=True)
 
             if telematics is None:
-                st.warning("No telemetry received yet. Make sure live_backend.py is running.")
+                ui["warning"].warning("No telemetry received yet. Make sure live_backend.py is running.")
                 return
+            ui["warning"].empty()
 
             feed_source = telematics.get("feed_source", "UNKNOWN")
             arrived = telematics.get("arrived", False)
@@ -547,40 +647,52 @@ with tab_dispatch:
             # --- Trip Plan: fixed full-journey baseline, cached once when the
             # trip was configured. Doesn't change as the truck drives — that's
             # the point, it's what "Live Remaining" below is measured against.
+            # Rendered into a single placeholder container, so switching it
+            # on/off (or refreshing identical values) never reshapes the
+            # rest of the layout.
             trip_plan = routing.get("trip_plan") if routing is not None else None
             if trip_plan is not None:
-                st.subheader("Trip Plan (fixed at departure)")
-                plan_bv = trip_plan["business_value"]
-                plan_cols = st.columns(3)
-                plan_cols[0].metric(
-                    "Planned ETA (optimized)", f"{trip_plan['optimized_route']['total_time_mins']:.0f} min"
-                )
-                plan_cols[1].metric("Time Cost vs Standard", f"{-plan_bv['time_saved_mins']:+.0f} min")
-                plan_cols[2].metric(
-                    "Planned Spoilage Risk Avoided",
-                    f"{plan_bv['standard_spoilage_risk_pct'] - plan_bv['optimized_spoilage_risk_pct']:.1f} pts",
-                )
-                st.divider()
+                with ui["plan_wrap"].container():
+                    st.subheader("Trip Plan (fixed at departure)")
+                    plan_bv = trip_plan["business_value"]
+                    plan_cols = st.columns(3)
+                    plan_cols[0].metric(
+                        "Planned ETA (optimized)", f"{trip_plan['optimized_route']['total_time_mins']:.0f} min"
+                    )
+                    plan_cols[1].metric("Time Cost vs Standard", f"{-plan_bv['time_saved_mins']:+.0f} min")
+                    plan_cols[2].metric(
+                        "Planned Spoilage Risk Avoided",
+                        f"{plan_bv['standard_spoilage_risk_pct'] - plan_bv['optimized_spoilage_risk_pct']:.1f} pts",
+                    )
+                    st.divider()
+            else:
+                ui["plan_wrap"].empty()
 
             # --- Live Remaining: recomputed from the truck's CURRENT position
             # on every poll — this is what used to be frozen at the full-trip
             # value all the way through the drive; it now genuinely shrinks.
+            # Same "must write every run" rule as the chart below: give the
+            # else branch something to write too, so these three placeholders
+            # are never skipped on a run (e.g. a transient routing hiccup)
+            # only to be written for the first time on a later fragment-only
+            # rerun.
             if routing is not None:
                 bv = routing["business_value"]
                 optimized = routing["optimized_route"]
 
-                st.subheader("Live Remaining Route")
-                value_cols = st.columns(2)
-                value_cols[0].metric("Remaining ETA (optimized)", f"{optimized['total_time_mins']:.0f} min")
-                value_cols[1].metric(
+                ui["live_header"].subheader("Live Remaining Route")
+                ui["live_eta"].metric("Remaining ETA (optimized)", f"{optimized['total_time_mins']:.0f} min")
+                ui["live_risk"].metric(
                     "Remaining Spoilage Risk Avoided",
                     f"{bv['standard_spoilage_risk_pct'] - bv['optimized_spoilage_risk_pct']:.1f} pts",
                     help=f"Optimized: {bv['optimized_spoilage_risk_pct']:.1f}% risk vs "
                          f"Standard: {bv['standard_spoilage_risk_pct']:.1f}% risk, for the route "
                          f"from where the truck is right now to the destination.",
                 )
-
-            st.divider()
+            else:
+                ui["live_header"].subheader("Live Remaining Route")
+                ui["live_eta"].metric("Remaining ETA (optimized)", "n/a")
+                ui["live_risk"].metric("Remaining Spoilage Risk Avoided", "n/a")
 
             # --- Cargo Condition: what's actually happening to the shipment,
             # driven by cargo_temp_c (mechanical risk = road damage already
@@ -588,95 +700,119 @@ with tab_dispatch:
             # far). Replace cargo_temp_c's source with a real reefer sensor
             # feed via /v1/telematics/incoming once hardware is wired up —
             # everything downstream of that one number already works.
-            st.subheader("Cargo Condition")
-            cargo_cols = st.columns(4)
-            cargo_cols[0].metric("Cargo Temperature", f"{cargo_temp_c:.1f} C")
+            ui["cargo_header"].subheader("Cargo Condition")
+            ui["cargo_temp"].metric("Cargo Temperature", f"{cargo_temp_c:.1f} C")
             mech_risk = telematics.get("mechanical_risk_pct")
-            cargo_cols[1].metric(
+            ui["cargo_mech"].metric(
                 "Mechanical Risk (roads so far)",
                 f"{mech_risk:.1f}%" if mech_risk is not None else "n/a",
                 help="Road-roughness damage accrued on the distance already driven. "
                      "Only tracked in Simulator mode, which has a fixed planned route.",
             )
-            cargo_cols[2].metric(
+            ui["cargo_thermal"].metric(
                 "Thermal Risk (heat so far)",
                 f"{telematics.get('thermal_risk_pct', 0):.1f}%",
                 help="Temperature-exposure damage accrued so far, integrated over elapsed time.",
             )
-            cargo_cols[3].metric(
+            ui["cargo_value"].metric(
                 "Value at Risk So Far",
                 f"R {telematics.get('expected_loss_rand_so_far', 0):,.0f}",
                 help="Composite (mechanical + thermal) risk applied to the shipment value.",
             )
 
-            if temp_status == "Critical":
-                st.error(
+            if temp_status == "Awaiting Motion":
+                ui["cargo_alert"].info(
+                    f"⏸️ Truck parked at {cargo_temp_c:.1f} C — cargo risk metrics are frozen until it "
+                    f"starts moving, so a stationary shipment doesn't silently accrue spoilage risk "
+                    f"before it's actually departed."
+                )
+            elif temp_status == "Critical":
+                ui["cargo_alert"].error(
                     f"Cargo temperature CRITICAL at {cargo_temp_c:.1f} C — thermal spoilage risk is "
                     f"accelerating (composite risk {telematics.get('composite_cargo_risk_pct', 0):.1f}%)."
                 )
             elif temp_status == "Elevated":
-                st.warning(
+                ui["cargo_alert"].warning(
                     f"Cargo temperature elevated at {cargo_temp_c:.1f} C — above the "
                     f"{st.session_state.safe_temp_max_c:.1f} C safe threshold, "
                     f"spoilage risk is accruing faster than baseline."
                 )
             else:
-                st.success(f"Cargo temperature nominal at {cargo_temp_c:.1f} C.")
+                ui["cargo_alert"].success(f"Cargo temperature nominal at {cargo_temp_c:.1f} C.")
 
             # --- Live temperature history chart -----------------------------
-            # Only appends while the trip is still moving. Without this check
-            # it kept appending a fresh point every 2s forever — including
-            # long after arrival — so the chart never settled and kept
-            # redrawing/scrolling even though nothing was actually changing.
-            if not arrived:
+            # Only appends while the trip is genuinely underway: not yet
+            # arrived, AND (for hardware mode) actually moving. Without the
+            # "arrived" check it kept appending forever after the trip
+            # finished; without the "awaiting motion" check it did the same
+            # for a truck that was simply parked and hadn't departed yet —
+            # in both cases the chart never settled and kept scrolling even
+            # though nothing was actually changing.
+            awaiting_motion = telematics.get("awaiting_motion", False)
+            if not arrived and not awaiting_motion:
                 st.session_state.temp_history.append({
                     "poll": len(st.session_state.temp_history),
                     "Cargo Temp (C)": cargo_temp_c,
                 })
                 st.session_state.temp_history = st.session_state.temp_history[-200:]  # cap buffer length
 
+            # ui["chart"] MUST be written to on every single run of this
+            # fragment, including the very first one — a placeholder created
+            # outside a fragment (st.empty(), in the scaffold above) has to
+            # be claimed by an actual call during the run that creates it,
+            # or Streamlit can't reserve a stable position for it. Gating
+            # this behind "len(temp_history) >= 2" meant that on the very
+            # first poll (0 or 1 points collected so far), the chart
+            # placeholder was left untouched; the first time a LATER,
+            # fragment-only rerun tried to draw into it, Streamlit raised
+            # "container was not written to during the initial run". Always
+            # drawing something — even a single-point placeholder chart —
+            # keeps the slot claimed from run one, so later reruns can just
+            # update it in place.
             if len(st.session_state.temp_history) >= 2:
                 chart_data = {
                     row["poll"]: row["Cargo Temp (C)"] for row in st.session_state.temp_history
                 }
-                st.line_chart(chart_data, height=180)
+                ui["chart"].line_chart(chart_data, height=180)
                 if arrived:
-                    st.caption(
+                    ui["chart_caption"].caption(
                         f"🏁 Trip complete — cargo temperature history frozen at arrival "
                         f"(safe threshold: {st.session_state.safe_temp_max_c:.1f} C)."
                     )
                 else:
-                    st.caption(
+                    ui["chart_caption"].caption(
                         f"Live cargo temperature over the session "
                         f"(safe threshold: {st.session_state.safe_temp_max_c:.1f} C). "
                         "This is exactly where a real reefer-unit sensor feed would plug in."
                     )
-
-            st.divider()
+            else:
+                ui["chart"].line_chart({0: cargo_temp_c}, height=180)
+                ui["chart_caption"].caption("Collecting cargo temperature history…")
 
             # --- Telemetry metrics -----------------------------------------
-            metric_cols = st.columns(4)
-            metric_cols[0].metric("Vehicle ID", telematics.get("vehicle_id", "—"))
-            metric_cols[1].metric(
+            ui["tel_vehicle"].metric("Vehicle ID", telematics.get("vehicle_id", "—"))
+            ui["tel_coords"].metric(
                 "Current Coordinates",
                 f"{telematics.get('lat', 0):.4f}, {telematics.get('lon', 0):.4f}",
             )
-            metric_cols[2].metric("Cargo Temperature", f"{cargo_temp_c:.1f} C")
+            ui["tel_temp"].metric("Cargo Temperature", f"{cargo_temp_c:.1f} C")
             if progress_pct is not None:
-                metric_cols[3].metric("Trip Progress", f"{progress_pct:.0f}%")
+                ui["tel_fourth"].metric("Trip Progress", f"{progress_pct:.0f}%")
             elif routing is not None:
-                metric_cols[3].metric(
+                ui["tel_fourth"].metric(
                     "Spoilage Cost Index", f"{routing['optimized_route']['total_spoilage_cost']:.2f}",
                 )
+            else:
+                ui["tel_fourth"].metric("Trip Progress", "n/a")
 
             if feed_source == FEED_SOURCE_REAL:
-                st.success(f"Data Feed Source: {feed_source}")
+                ui["feed"].success(f"Data Feed Source: {feed_source}")
             elif feed_source == FEED_SOURCE_SIMULATED:
-                st.info(f"Data Feed Source: {feed_source}" + ("  |  Arrived at destination" if arrived else ""))
+                ui["feed"].info(f"Data Feed Source: {feed_source}" + ("  |  Arrived at destination" if arrived else ""))
             else:
-                st.warning(f"Data Feed Source: {feed_source}")
+                ui["feed"].warning(f"Data Feed Source: {feed_source}")
 
-            st.caption(f"Last updated: {datetime.now().strftime('%H:%M:%S')}")
+            ui["updated"].caption(f"Last updated: {datetime.now().strftime('%H:%M:%S')}")
 
         dispatch_metrics_view()
 
@@ -805,6 +941,11 @@ with tab_weather:
     st.caption(
         "Live ambient climate data at the vehicle's position and along the active route, "
         "via the free Open-Meteo API — no API key required."
+    )
+    st.caption(
+        "ℹ️ Readings are a live forecast-model estimate for the exact coordinate, not a "
+        "nearby weather station observation — expect roughly a 1-3°C margin versus sites "
+        "like Google Weather that blend in local station data."
     )
 
     weather_telematics = backend_get("/v1/telematics/truck-01", silent=True)
