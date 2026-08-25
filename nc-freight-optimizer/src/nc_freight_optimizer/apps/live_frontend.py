@@ -92,6 +92,25 @@ st.markdown(
         letter-spacing: 0.04em;
         font-size: 0.75rem !important;
     }
+
+    /* --- Kill the "stale element" fade/pulse during fragment reruns ------
+       Streamlit marks every element's wrapper div data-stale="true" for the
+       duration of any script or fragment rerun, and applies an opacity dip
+       + transition to it as a built-in "this is updating" cue (confirmed by
+       inspecting Streamlit's own frontend bundle: stElementContainer sets
+       data-stale from the isStale flag, with opacity:{stale-value} and a
+       transition applied whenever that flag is true). With dispatch_metrics
+       _view() re-running every POLL_INTERVAL_SECONDS via run_every, that
+       cue fires constantly and reads as a continuous pulse/blink across
+       every metric, chart, and alert in the fragment — not a bug in this
+       app's code, just Streamlit's own "updating" indicator running at
+       poll speed. Forcing opacity back to 1 (and killing the transition)
+       on any stale element removes the pulse; the actual data still
+       updates in place exactly as before, just without the fade. */
+    [data-testid="stElementContainer"][data-stale="true"] {
+        opacity: 1 !important;
+        transition: none !important;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -419,8 +438,17 @@ def render_live_map(initial_routing: dict | None, initial_telematics: dict) -> N
         }} catch (e) {{ console.warn('pollTelemetry failed:', e); }}
       }}
 
+      // Routing (the green/grey lines) polls at the SAME cadence as
+      // telemetry (the truck marker), not half as often. /v1/routing/
+      // truck-01 always recomputes the optimized/standard lines fresh from
+      // wherever the truck's CURRENT position snaps to on the road network
+      // — so when this ran at POLL_MS * 2 (half the marker's update rate),
+      // the marker kept advancing every 2s while the line's start point
+      // stayed frozen at a stale position for up to 4s, visibly trailing
+      // off the line until the next routing poll snapped it back into
+      // place. Matching the interval removes that growing/snapping cycle.
       setInterval(pollTelemetry, POLL_MS);
-      setInterval(pollRouting, POLL_MS * 2);
+      setInterval(pollRouting, POLL_MS);
     </script>
     """
     components.html(html, height=540, scrolling=False)

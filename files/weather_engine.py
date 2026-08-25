@@ -8,15 +8,25 @@ hammers the external service, and a hard fallback to a clear-weather
 baseline so a network blip or API outage can never take down routing,
 telemetry, or the dispatch UI that depend on it.
 
+Optionally, if an OPENWEATHERMAP_API_KEY environment variable is set, current
+readings are tried against OpenWeatherMap first — its "current weather"
+endpoint blends in real nearby station observations rather than being a pure
+forecast-model estimate, so it tracks a live thermometer (and Google's
+weather numbers, which do the same blending) more closely. Open-Meteo is
+still always the fallback if OpenWeatherMap isn't configured or a call to it
+fails, so nothing about this app's behavior changes for anyone who doesn't
+set the key.
+
 Deliberately kept dependency-free beyond `requests` and stateless from the
 caller's point of view — live_backend.py never needs to know whether a given
-reading came from the network or the cache or the fallback; it just gets a
-WeatherReading back, always.
+reading came from OpenWeatherMap, Open-Meteo, the cache, or the fallback; it
+just gets a WeatherReading back, always.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from typing import TypedDict
@@ -29,7 +39,14 @@ logger = logging.getLogger("weather_engine")
 # Configuration
 # ---------------------------------------------------------------------------
 OPEN_METEO_BASE_URL = "https://api.open-meteo.com/v1/forecast"
+OPENWEATHERMAP_BASE_URL = "https://api.openweathermap.org/data/2.5/weather"
 REQUEST_TIMEOUT_SECONDS = 5.0
+
+# Free-tier station-blended provider. Optional — unset means "use Open-Meteo
+# only", exactly as before. Get a free key at https://openweathermap.org/api
+# if closer alignment with Google/ground-truth station readings matters more
+# than staying fully keyless.
+OPENWEATHERMAP_API_KEY = os.environ.get("OPENWEATHERMAP_API_KEY", "").strip()
 
 # Fallback used whenever the live API can't be reached in time or returns
 # something malformed — a plausible clear, mild Northern Cape day, not an
@@ -56,7 +73,7 @@ class WeatherReading(TypedDict):
     temp_c: float
     rain_mm: float
     alert: str          # "Normal" | "Extreme Heat" | "Heavy Rain / Washout Risk"
-    source: str          # "open-meteo" | "fallback"
+    source: str          # "openweathermap" | "open-meteo" | "fallback"
 
 
 def _cache_key(lat: float, lon: float) -> tuple[float, float]:
@@ -84,25 +101,48 @@ def _fallback_reading() -> WeatherReading:
     }
 
 
-def get_current_weather(lat: float, lon: float) -> WeatherReading:
-    """Returns live ambient weather for a coordinate.
+def _fetch_openweathermap(lat: float, lon: float) -> WeatherReading | None:
+    """Tries OpenWeatherMap's current-weather endpoint, which blends in
+    real nearby station observations. Returns None (never raises) on any
+    failure — timeout, network error, bad key, malformed response — so the
+    caller can fall through to Open-Meteo exactly as if this provider
+    weren't configured at all."""
+    try:
+        response = requests.get(
+            OPENWEATHERMAP_BASE_URL,
+            params={
+                "lat": lat,
+                "lon": lon,
+                "appid": OPENWEATHERMAP_API_KEY,
+                "units": "metric",
+            },
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        temp_c = float(payload["main"]["temp"])
+        # OWM reports rain volume for the last 1h (or 3h) under "rain", only
+        # present in the payload when it's actually raining.
+        rain_block = payload.get("rain") or {}
+        rain_mm = float(rain_block.get("1h", rain_block.get("3h", 0.0)) or 0.0)
+        return {
+            "temp_c": temp_c,
+            "rain_mm": rain_mm,
+            "alert": _classify_alert(temp_c, rain_mm),
+            "source": "openweathermap",
+        }
+    except Exception as exc:  # noqa: BLE001 - any failure just falls through
+        logger.warning(
+            "weather_engine -> OpenWeatherMap request failed for (%.4f, %.4f): %s. Falling back to Open-Meteo.",
+            lat, lon, exc,
+        )
+        return None
 
-    Backed by a small TTL cache and the keyless Open-Meteo current-weather
-    API. This function must never raise — routing, telemetry, and thermal
-    logic all depend on always getting *some* reading back, so any network
-    error, timeout, or malformed response degrades to the fallback baseline
-    instead of propagating.
-    """
-    key = _cache_key(lat, lon)
-    now = time.monotonic()
 
-    with _cache_lock:
-        cached = _cache.get(key)
-        if cached is not None:
-            cached_at, reading = cached
-            if now - cached_at < CACHE_TTL_SECONDS:
-                return reading
-
+def _fetch_open_meteo(lat: float, lon: float) -> WeatherReading | None:
+    """Tries the free, keyless Open-Meteo forecast-model endpoint. Returns
+    None (never raises) on any failure, so the caller falls through to the
+    hard fallback baseline."""
     try:
         response = requests.get(
             OPEN_METEO_BASE_URL,
@@ -119,7 +159,7 @@ def get_current_weather(lat: float, lon: float) -> WeatherReading:
         current = payload["current"]
         temp_c = float(current["temperature_2m"])
         rain_mm = float(current.get("rain", 0.0) or 0.0)
-        reading: WeatherReading = {
+        return {
             "temp_c": temp_c,
             "rain_mm": rain_mm,
             "alert": _classify_alert(temp_c, rain_mm),
@@ -133,6 +173,36 @@ def get_current_weather(lat: float, lon: float) -> WeatherReading:
             "weather_engine -> Open-Meteo request failed for (%.4f, %.4f): %s. Using fallback baseline.",
             lat, lon, exc,
         )
+        return None
+
+
+def get_current_weather(lat: float, lon: float) -> WeatherReading:
+    """Returns live ambient weather for a coordinate.
+
+    Backed by a small TTL cache. Tries OpenWeatherMap first if
+    OPENWEATHERMAP_API_KEY is set (station-blended, closer to Google's
+    numbers); otherwise, or if that fails, falls through to the keyless
+    Open-Meteo forecast-model estimate; and if that also fails, falls
+    through to a hard fallback baseline. This function must never raise —
+    routing, telemetry, and thermal logic all depend on always getting
+    *some* reading back.
+    """
+    key = _cache_key(lat, lon)
+    now = time.monotonic()
+
+    with _cache_lock:
+        cached = _cache.get(key)
+        if cached is not None:
+            cached_at, reading = cached
+            if now - cached_at < CACHE_TTL_SECONDS:
+                return reading
+
+    reading: WeatherReading | None = None
+    if OPENWEATHERMAP_API_KEY:
+        reading = _fetch_openweathermap(lat, lon)
+    if reading is None:
+        reading = _fetch_open_meteo(lat, lon)
+    if reading is None:
         reading = _fallback_reading()
 
     with _cache_lock:

@@ -938,54 +938,27 @@ with tab_field_report:
 # ---------------------------------------------------------------------------
 with tab_weather:
     st.title("🌤️ Route Weather Analytics")
-    st.caption(
-        "Live ambient climate data at the vehicle's position and along the active route, "
-        "via the free Open-Meteo API — no API key required."
-    )
-    st.caption(
-        "ℹ️ Readings are a live forecast-model estimate for the exact coordinate, not a "
-        "nearby weather station observation — expect roughly a 1-3°C margin versus sites "
-        "like Google Weather that blend in local station data."
-    )
 
-    weather_telematics = backend_get("/v1/telematics/truck-01", silent=True)
-    ambient = (weather_telematics or {}).get("ambient_weather") or {
-        "temp_c": 25.0, "rain_mm": 0.0, "alert": "Normal",
-    }
-    ambient_temp_c = ambient.get("temp_c", 25.0)
+    # --- One-time layout scaffold, same pattern as dispatch_metrics_view()
+    # above. This tab used to fetch its data with plain backend_get() calls
+    # made once per full script rerun (tab switch, sidebar click, browser
+    # refresh) and nothing else — there was no @st.fragment(run_every=...)
+    # driving it at all, so "Current Position" and its temperature only
+    # ever updated when something ELSE happened to trigger a full rerun,
+    # never on its own timer while the truck was actually driving. Every
+    # placeholder below is written to unconditionally on every single
+    # fragment run (never skipped by an if/else branch) — st.dataframe, like
+    # st.line_chart, needs its slot claimed on every run or a later
+    # fragment-only write into it raises the same "container not written to
+    # during the initial run" error fixed on the Dispatch tab's chart.
+    wui: dict = {"source_info": st.empty()}
 
-    if ambient_temp_c >= 38.0:
-        warming_rate_status = "🔥 Accelerated"
-    elif ambient_temp_c < 20.0:
-        warming_rate_status = "🧊 Suppressed"
-    else:
-        warming_rate_status = "➖ Normal"
-
-    st.subheader("Active Vehicle Climate Context")
+    wui["climate_header"] = st.empty()
     weather_cols = st.columns(3)
-    weather_cols[0].metric("Outside Ambient Temperature", f"{ambient_temp_c:.1f} °C")
-    weather_cols[1].metric("Rain Index", f"{ambient.get('rain_mm', 0.0):.1f} mm")
-    weather_cols[2].metric(
-        "Dynamic Thermodynamic Warming Rate",
-        warming_rate_status,
-        help=(
-            "How fast an IDLING reefer chamber is modeled to warm up right now, driven by "
-            "live ambient temperature: Accelerated ≥38°C, Normal 20-38°C, Suppressed <20°C."
-        ),
-    )
-
-    if ambient.get("alert") == "Extreme Heat":
-        st.error(
-            "🔥 Extreme heat at the vehicle's current position — refrigeration compressor "
-            "under significant thermal stress."
-        )
-    elif ambient.get("alert") == "Heavy Rain / Washout Risk":
-        st.warning(
-            "🌧️ Heavy rain at the vehicle's current position — unpaved segments at "
-            "elevated mud-washout risk."
-        )
-    else:
-        st.success(f"✅ No weather alert at the vehicle's current position ({ambient_temp_c:.1f} °C).")
+    wui["temp_metric"] = weather_cols[0].empty()
+    wui["rain_metric"] = weather_cols[1].empty()
+    wui["warm_metric"] = weather_cols[2].empty()
+    wui["climate_alert"] = st.empty()
 
     st.divider()
     st.subheader("Road Condition Forecast — Along the Optimized Route")
@@ -994,52 +967,164 @@ with tab_weather:
         "put as the truck drives. Current Position is separate and always reflects wherever "
         "the truck is right now — that's the one that moves."
     )
+    wui["forecast_empty_state"] = st.empty()
+    wui["forecast_table"] = st.empty()
+    wui["forecast_alert"] = st.empty()
+    wui["hardware_note"] = st.empty()
+    wui["source_footer"] = st.empty()
 
-    weather_profile = backend_get("/v1/routing/weather-profile", silent=True)
-    if weather_profile is None or not weather_profile.get("segments"):
-        st.info("Start a trip in the Fleet Dispatch Hub to see a weather forecast along the route.")
-    else:
+    @st.fragment(run_every=POLL_INTERVAL_SECONDS)
+    def weather_tab_view():
+        weather_telematics = backend_get("/v1/telematics/truck-01", silent=True)
+        active_weather_source = ((weather_telematics or {}).get("ambient_weather") or {}).get("source")
+
+        with wui["source_info"].container():
+            if active_weather_source == "openweathermap":
+                st.caption(
+                    "Live ambient climate data at the vehicle's position and along the active "
+                    "route, via OpenWeatherMap — blends in nearby station observations, so this "
+                    "should track closely with sites like Google Weather."
+                )
+            else:
+                st.caption(
+                    "Live ambient climate data at the vehicle's position and along the active "
+                    "route, via the free Open-Meteo API — no API key required."
+                )
+                st.caption(
+                    "ℹ️ Readings are a live forecast-model estimate for the exact coordinate, "
+                    "not a nearby weather station observation — expect roughly a 1-3°C margin "
+                    "versus sites like Google Weather that blend in local station data. Set an "
+                    "OPENWEATHERMAP_API_KEY environment variable (free tier at "
+                    "openweathermap.org) to switch to station-blended readings instead."
+                )
+
+        ambient = (weather_telematics or {}).get("ambient_weather") or {
+            "temp_c": 25.0, "rain_mm": 0.0, "alert": "Normal",
+        }
+        ambient_temp_c = ambient.get("temp_c", 25.0)
+
+        if ambient_temp_c >= 38.0:
+            warming_rate_status = "🔥 Accelerated"
+        elif ambient_temp_c < 20.0:
+            warming_rate_status = "🧊 Suppressed"
+        else:
+            warming_rate_status = "➖ Normal"
+
+        wui["climate_header"].subheader("Active Vehicle Climate Context")
+        wui["temp_metric"].metric("Outside Ambient Temperature", f"{ambient_temp_c:.1f} °C")
+        wui["rain_metric"].metric("Rain Index", f"{ambient.get('rain_mm', 0.0):.1f} mm")
+        wui["warm_metric"].metric(
+            "Dynamic Thermodynamic Warming Rate",
+            warming_rate_status,
+            help=(
+                "How fast an IDLING reefer chamber is modeled to warm up right now, driven by "
+                "live ambient temperature: Accelerated ≥38°C, Normal 20-38°C, Suppressed <20°C."
+            ),
+        )
+
+        if ambient.get("alert") == "Extreme Heat":
+            wui["climate_alert"].error(
+                "🔥 Extreme heat at the vehicle's current position — refrigeration compressor "
+                "under significant thermal stress."
+            )
+        elif ambient.get("alert") == "Heavy Rain / Washout Risk":
+            wui["climate_alert"].warning(
+                "🌧️ Heavy rain at the vehicle's current position — unpaved segments at "
+                "elevated mud-washout risk."
+            )
+        else:
+            wui["climate_alert"].success(
+                f"✅ No weather alert at the vehicle's current position ({ambient_temp_c:.1f} °C)."
+            )
+
+        weather_profile = backend_get("/v1/routing/weather-profile", silent=True)
+        if weather_profile is None or not weather_profile.get("segments"):
+            wui["forecast_empty_state"].info(
+                "Start a trip in the Fleet Dispatch Hub to see a weather forecast along the route."
+            )
+            # Every placeholder below must still be touched this run — an
+            # untouched st.dataframe slot here is exactly what caused the
+            # chart crash before: claim it now with an empty table, exactly
+            # as the "no history yet" branch does for the temperature chart.
+            wui["forecast_table"].dataframe([], use_container_width=True, hide_index=True)
+            wui["forecast_alert"].empty()
+            wui["hardware_note"].empty()
+            wui["source_footer"].empty()
+            return
+        wui["forecast_empty_state"].empty()
+
         forecast_rows = []
         any_heat_alert = False
         any_rain_alert = False
         for seg in weather_profile["segments"]:
+            if seg["label"] == "Current Position":
+                # Reuse the exact same ambient reading already shown in the
+                # "Active Vehicle Climate Context" metrics above, instead of
+                # weather-profile's own independent lookup for the same
+                # coordinate. This tab fetches /v1/telematics/truck-01 first
+                # and /v1/routing/weather-profile a moment later — each one
+                # snapshots the truck's live position separately, and for a
+                # fast-moving (simulator, 45x accelerated) truck that gap is
+                # enough to land in a different weather-cache grid cell,
+                # showing two slightly different numbers for what's supposed
+                # to read as the same "right now". Overriding with the
+                # already-fetched ambient dict guarantees they always match.
+                row_temp_c = ambient_temp_c
+                row_rain_mm = ambient.get("rain_mm", 0.0)
+                row_alert = ambient.get("alert", "Normal")
+            else:
+                row_temp_c = seg["temp_c"]
+                row_rain_mm = seg["rain_mm"]
+                row_alert = seg["alert"]
+
             forecast_rows.append({
                 "Segment": seg["label"],
                 "Latitude": f"{seg['lat']:.4f}",
                 "Longitude": f"{seg['lon']:.4f}",
-                "Temperature (°C)": f"{seg['temp_c']:.1f}",
-                "Rain (mm)": f"{seg['rain_mm']:.1f}",
-                "Alert": seg["alert"],
+                "Temperature (°C)": f"{row_temp_c:.1f}",
+                "Rain (mm)": f"{row_rain_mm:.1f}",
+                "Alert": row_alert,
             })
-            if seg["alert"] == "Extreme Heat":
+            if row_alert == "Extreme Heat":
                 any_heat_alert = True
-            elif seg["alert"] == "Heavy Rain / Washout Risk":
+            elif row_alert == "Heavy Rain / Washout Risk":
                 any_rain_alert = True
 
-        st.dataframe(forecast_rows, use_container_width=True, hide_index=True)
+        wui["forecast_table"].dataframe(forecast_rows, use_container_width=True, hide_index=True)
 
         if any_heat_alert:
-            st.error(
+            wui["forecast_alert"].error(
                 "🔥 One or more segments ahead report extreme heat — refrigeration "
                 "compressors along this route are under significant strain."
             )
-        if any_rain_alert:
-            st.warning(
+        elif any_rain_alert:
+            wui["forecast_alert"].warning(
                 "🌧️ One or more segments ahead report heavy rain — unpaved/gravel "
                 "sections at elevated risk of mud washouts."
             )
-        if not any_heat_alert and not any_rain_alert:
-            st.success("✅ No extreme weather alerts along the route right now.")
+        else:
+            wui["forecast_alert"].success("✅ No extreme weather alerts along the route right now.")
 
         if weather_profile.get("route_basis") == "remaining_route":
-            st.caption(
-                "⚠️ Hardware mode has no fixed origin town, so Origin/Midpoint/Destination "
-                "above are sampled from the truck's current position onward — they will "
-                "converge as it nears the destination. That's expected, not a bug."
+            wui["hardware_note"].caption(
+                "⚠️ No fixed trip plan exists yet, so Origin/Midpoint/Destination above are "
+                "sampled from the truck's current position onward instead — they will converge "
+                "as it nears the destination. This resolves automatically once a departure "
+                "baseline is established (first GPS fix in Hardware mode, or the moment a "
+                "Simulator trip starts)."
             )
+        else:
+            wui["hardware_note"].empty()
 
         source_label = weather_profile["segments"][0].get("source", "open-meteo")
-        st.caption(
-            f"Weather data source: {source_label} · via Open-Meteo (no API key required) · "
+        source_note = (
+            "station-blended, requires OPENWEATHERMAP_API_KEY"
+            if source_label == "openweathermap"
+            else "forecast-model estimate, no API key required"
+        )
+        wui["source_footer"].caption(
+            f"Weather data source: {source_label} ({source_note}) · "
             "cached up to 5 minutes per ~1.1km grid cell."
         )
+
+    weather_tab_view()
