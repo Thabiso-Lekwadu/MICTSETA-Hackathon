@@ -4,16 +4,24 @@ live_frontend.py
 Streamlit command dashboard for the Northern Cape Fleet Dispatch system.
 Talks to live_backend.py (FastAPI, http://127.0.0.1:8000) over plain HTTP.
 
-Two tabs:
-  Fleet Dispatch Hub       - trip setup, live map with the standard route and
-                              the spoilage-optimized route side by side, and
-                              the business-value numbers behind the choice.
-  Driver Ground-Truth Form - crowd-sourced road-condition reports that trigger
-                              live reroutes on the backend.
+Reorganized into five tabs (spec §5):
+  1. 🛰️  Customer Route Tracker        - live vehicle position, cargo temp,
+                                          compressor workload, and marker on a map.
+  2. 📝  Driver Reporting Desk          - mobile ground-truth form; a storm/washout
+                                          report pins the segment to IRI ≥ 6.0 and
+                                          forces a detour on the next reroute.
+  3. 🔮  Journey Prediction & Scheduling - 7-day future planner: synthetic Stream
+                                          A/B/C ingestion ticker, Monte Carlo
+                                          stochastic risk test, and an executive
+                                          departure-slot recommendation matrix.
+  4. 📊  Report                          - the AI-generated business-value memo
+                                          (local Qwen2.5-1.5B via the backend).
+  5. 🌤️  Weather                         - live ambient climate + forecast along
+                                          the route corridor.
 
-Live polling is isolated inside a Streamlit fragment, so it refreshes only the
-map/metrics block on its own timer instead of rerunning the whole page. That
-is what stops the flicker/reset that used to hit the Ground-Truth tab too.
+Zero destructive modifications: the live Traccar hardware feed, the smooth
+browser-side live map, and the driver manual-override loop are all preserved
+exactly as they worked before — only reorganized and extended.
 
 Run standalone (uv workspace, alongside a running live_backend.py):
     uv run streamlit run live_frontend.py
@@ -29,11 +37,40 @@ if sys.platform == "win32":
 
 import json
 import logging
-from datetime import datetime
+from datetime import date, datetime, time as dt_time, timedelta, timezone
+from pathlib import Path
 
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
+
+# pandas is used for the synthetic-stream ingestion ticker and the executive
+# matrix. Imported defensively so a missing install produces a clear message
+# rather than a hard crash of the whole dashboard.
+try:
+    import pandas as pd
+except ImportError:  # pragma: no cover
+    pd = None
+
+# streamlit_folium + folium power the Journey Prediction tab's static hazard map
+# (spec architecture note calls for streamlit_folium). Optional: if either isn't
+# installed, that one map degrades to a caption and the rest of the tab still works.
+try:
+    import folium
+    from streamlit_folium import st_folium
+    HAVE_FOLIUM = True
+except ImportError:  # pragma: no cover
+    folium = None
+    st_folium = None
+    HAVE_FOLIUM = False
+
+# The synthetic data generator is a sibling module. Imported lazily/optionally so
+# the dashboard still loads if it's absent — only the ingestion ticker needs it,
+# and it degrades to an explanatory message.
+try:
+    import vrp_simulation_generator as vrpsim
+except ImportError:  # pragma: no cover
+    vrpsim = None
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -50,6 +87,14 @@ FEED_SOURCE_SIMULATED = "SIMULATED TELEMETRY MATRIX"
 
 OPTIMIZED_COLOR = "#1f9e89"   # teal — spoilage-optimized route
 STANDARD_COLOR = "#9a9a9a"    # grey, dashed — standard time-only route
+HAZARD_COLOR = "#d64545"      # red — forecast hazard zones
+
+# The three synthetic-stream artifacts written by vrp_simulation_generator.py.
+WEATHER_CSV = Path("synthetic_weather_forecast.csv")
+ROAD_CSV = Path("synthetic_road_conditions.csv")
+SENSOR_CSV = Path("synthetic_cold_sensors.csv")
+
+PREDICTION_MAX_HORIZON_DAYS = 7
 
 logging.basicConfig(
     level=logging.INFO,
@@ -65,10 +110,7 @@ st.set_page_config(
 )
 
 # ---------------------------------------------------------------------------
-# Typography — a distinct, deliberate font pairing instead of the Streamlit
-# default. Headings in Space Grotesk (a geometric, slightly technical
-# display face), body/metrics in IBM Plex Sans (clean, highly legible at
-# small sizes for dense dashboard numbers).
+# Typography
 # ---------------------------------------------------------------------------
 st.markdown(
     """
@@ -92,21 +134,9 @@ st.markdown(
         letter-spacing: 0.04em;
         font-size: 0.75rem !important;
     }
-
-    /* --- Kill the "stale element" fade/pulse during fragment reruns ------
-       Streamlit marks every element's wrapper div data-stale="true" for the
-       duration of any script or fragment rerun, and applies an opacity dip
-       + transition to it as a built-in "this is updating" cue (confirmed by
-       inspecting Streamlit's own frontend bundle: stElementContainer sets
-       data-stale from the isStale flag, with opacity:{stale-value} and a
-       transition applied whenever that flag is true). With dispatch_metrics
-       _view() re-running every POLL_INTERVAL_SECONDS via run_every, that
-       cue fires constantly and reads as a continuous pulse/blink across
-       every metric, chart, and alert in the fragment — not a bug in this
-       app's code, just Streamlit's own "updating" indicator running at
-       poll speed. Forcing opacity back to 1 (and killing the transition)
-       on any stale element removes the pulse; the actual data still
-       updates in place exactly as before, just without the fade. */
+    /* Kill the "stale element" fade/pulse during fragment reruns (see the
+       long note in the original dispatch tab): forcing opacity back to 1 on
+       any stale element removes the pulse; data still updates in place. */
     [data-testid="stElementContainer"][data-stale="true"] {
         opacity: 1 !important;
         transition: none !important;
@@ -186,14 +216,36 @@ if "telemetry_mode" not in st.session_state:
 if "last_config" not in st.session_state:
     st.session_state.last_config = None
 if "temp_history" not in st.session_state:
-    st.session_state.temp_history = []  # list of {"poll": int, "cargo_temp_c": float} for the live chart
+    st.session_state.temp_history = []  # list of {"poll": int, "Cargo Temp (C)": float}
+if "montecarlo_result" not in st.session_state:
+    st.session_state.montecarlo_result = None
+if "slot_matrix" not in st.session_state:
+    st.session_state.slot_matrix = None
+if "predictive_route" not in st.session_state:
+    st.session_state.predictive_route = None
 
 towns_payload = backend_get("/v1/towns", silent=True)
 AVAILABLE_TOWNS = towns_payload["towns"] if towns_payload else []
 
+# Shared origin/destination selection — the single source of truth that keeps the
+# sidebar Trip Setup and the Journey Prediction tab consistent BOTH ways. Every
+# origin/destination selectbox (sidebar and prediction) reads its default from
+# these and writes its choice back, so changing the trip in either place is
+# reflected in the other on the next rerun. (Kept separate from widget keys to
+# avoid Streamlit's duplicate-key restriction across the two locations.)
+if AVAILABLE_TOWNS:
+    st.session_state.setdefault("active_origin", AVAILABLE_TOWNS[0])
+    st.session_state.setdefault(
+        "active_destination", AVAILABLE_TOWNS[1] if len(AVAILABLE_TOWNS) > 1 else AVAILABLE_TOWNS[0]
+    )
+
+
+def _town_index(town: str) -> int:
+    return AVAILABLE_TOWNS.index(town) if town in AVAILABLE_TOWNS else 0
+
 
 # ---------------------------------------------------------------------------
-# Sidebar — mode + trip setup
+# Sidebar — mode + trip setup + business settings
 # ---------------------------------------------------------------------------
 st.sidebar.title("Fleet Control Panel")
 
@@ -219,11 +271,14 @@ if not AVAILABLE_TOWNS:
     st.sidebar.warning("Backend unreachable — cannot load destination list.")
 else:
     if telemetry_mode == MODE_SIMULATOR:
-        origin_town = st.sidebar.selectbox("Starting point", options=AVAILABLE_TOWNS, index=0)
-        destination_default = 1 if len(AVAILABLE_TOWNS) > 1 else 0
-        destination_town = st.sidebar.selectbox(
-            "Destination", options=AVAILABLE_TOWNS, index=destination_default
+        origin_town = st.sidebar.selectbox(
+            "Starting point", options=AVAILABLE_TOWNS, index=_town_index(st.session_state.active_origin)
         )
+        st.session_state.active_origin = origin_town
+        destination_town = st.sidebar.selectbox(
+            "Destination", options=AVAILABLE_TOWNS, index=_town_index(st.session_state.active_destination)
+        )
+        st.session_state.active_destination = destination_town
         same_town = origin_town == destination_town
         if same_town:
             st.sidebar.caption("Starting point and destination must differ.")
@@ -238,7 +293,10 @@ else:
                 st.session_state.temp_history = []
                 st.rerun()
     else:
-        destination_town = st.sidebar.selectbox("Destination", options=AVAILABLE_TOWNS, index=0)
+        destination_town = st.sidebar.selectbox(
+            "Destination", options=AVAILABLE_TOWNS, index=_town_index(st.session_state.active_destination)
+        )
+        st.session_state.active_destination = destination_town
         st.sidebar.caption(
             "Your current position (from Traccar Client) is used as the starting "
             "point automatically. Point Traccar Client's server URL at:\n\n"
@@ -288,8 +346,8 @@ st.sidebar.subheader("Shipment Value")
 st.sidebar.caption(
     "The Rand value of this specific cargo — used to convert accrued spoilage-risk "
     "percentages into a Rand figure everywhere on the dashboard (route comparisons, "
-    "\"Value at Risk So Far\"). Set this per shipment; it overrides the system default "
-    "immediately, no restart needed."
+    "\"Value at Risk So Far\", Monte Carlo VaR). Set this per shipment; it overrides "
+    "the system default immediately, no restart needed."
 )
 shipment_value_input = st.sidebar.number_input(
     "Shipment Value (R)",
@@ -317,9 +375,7 @@ if st.session_state.trip_configured and st.session_state.last_config:
 # Live map — a single self-contained Leaflet component. It polls the backend
 # directly from the browser (fetch, on its own JS timer) and moves the truck
 # marker with a CSS transition, entirely independent of Streamlit reruns.
-# Route lines are only redrawn when the path actually changes (e.g. a driver
-# report triggers a reroute), not on every poll — that plus the CSS
-# transition is what makes the movement smooth instead of twitchy.
+# Route lines are only redrawn when the path actually changes.
 # ---------------------------------------------------------------------------
 def render_live_map(initial_routing: dict | None, initial_telematics: dict) -> None:
     truck_lat = initial_telematics["lat"]
@@ -344,25 +400,17 @@ def render_live_map(initial_routing: dict | None, initial_telematics: dict) -> N
     <div id="fleet-map"></div>
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     <script>
-      // Use the same backend URL the Python side already talks to
-      // successfully, instead of re-deriving it from window.location.
-      // Guessing it from the browser's own protocol/hostname breaks as
-      // soon as the dashboard is served from anywhere other than
-      // exactly "http://<same-host>:8000" (a tunnel, a different LAN
-      // IP, HTTPS, etc.) — the fetch then silently fails and the truck
-      // marker never receives new coordinates, even though the
-      // server-side polling (which isn't subject to browser CORS/
-      // mixed-content rules) keeps working and the metric numbers keep
-      // updating. That mismatch is exactly what caused the icon to sit
-      // still while the coordinates kept changing.
       const BACKEND = {json.dumps(BACKEND_URL)};
       const OPTIMIZED_COLOR = '{OPTIMIZED_COLOR}';
       const STANDARD_COLOR = '{STANDARD_COLOR}';
       const POLL_MS = {int(POLL_INTERVAL_SECONDS * 1000)};
 
       const map = L.map('fleet-map').setView([{truck_lat}, {truck_lon}], 7);
-      L.tileLayer('https://{{s}}.basemaps.cartocdn.com/light_all/{{z}}/{{x}}/{{y}}{{r}}.png', {{
-        attribution: 'CartoDB'
+      // Keyless OpenStreetMap tiles. CartoDB's basemap CDN now stamps an
+      // "API KEY REQUIRED" watermark across tiles for unkeyed use; OSM's
+      // standard tiles need no key and never watermark.
+      L.tileLayer('https://tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+        maxZoom: 19, attribution: '&copy; OpenStreetMap contributors'
       }}).addTo(map);
 
       let standardLayer = L.layerGroup().addTo(map);
@@ -438,15 +486,6 @@ def render_live_map(initial_routing: dict | None, initial_telematics: dict) -> N
         }} catch (e) {{ console.warn('pollTelemetry failed:', e); }}
       }}
 
-      // Routing (the green/grey lines) polls at the SAME cadence as
-      // telemetry (the truck marker), not half as often. /v1/routing/
-      // truck-01 always recomputes the optimized/standard lines fresh from
-      // wherever the truck's CURRENT position snaps to on the road network
-      // — so when this ran at POLL_MS * 2 (half the marker's update rate),
-      // the marker kept advancing every 2s while the line's start point
-      // stayed frozen at a stale position for up to 4s, visibly trailing
-      // off the line until the next routing poll snapped it back into
-      // place. Matching the interval removes that growing/snapping cycle.
       setInterval(pollTelemetry, POLL_MS);
       setInterval(pollRouting, POLL_MS);
     </script>
@@ -455,36 +494,111 @@ def render_live_map(initial_routing: dict | None, initial_telematics: dict) -> N
 
 
 # ---------------------------------------------------------------------------
+# Synthetic-stream ingestion — read the three CSVs, generating them on demand
+# if they don't exist yet (via vrp_simulation_generator).
+# ---------------------------------------------------------------------------
+def ensure_synthetic_streams(force: bool = False) -> dict:
+    """Returns {"weather": df, "road": df, "sensor": df, "status": str}. If the
+    CSVs are missing (or force=True) and vrp_simulation_generator is importable,
+    regenerates them first. Never raises — a failure returns empty frames and a
+    status message."""
+    if pd is None:
+        return {"weather": None, "road": None, "sensor": None,
+                "status": "pandas is not installed — cannot read the synthetic streams."}
+
+    need_generate = force or not (WEATHER_CSV.exists() and ROAD_CSV.exists() and SENSOR_CSV.exists())
+    if need_generate:
+        if vrpsim is None:
+            return {"weather": None, "road": None, "sensor": None,
+                    "status": ("Synthetic stream CSVs not found and vrp_simulation_generator.py "
+                               "could not be imported. Run `uv run vrp_simulation_generator.py` first.")}
+        try:
+            vrpsim.generate_all_streams(hours=72, write_files=True)
+        except Exception as exc:  # noqa: BLE001
+            return {"weather": None, "road": None, "sensor": None,
+                    "status": f"Failed to generate synthetic streams: {exc}"}
+
+    frames: dict = {"status": "ok"}
+    for key, path in (("weather", WEATHER_CSV), ("road", ROAD_CSV), ("sensor", SENSOR_CSV)):
+        try:
+            frames[key] = pd.read_csv(path)
+        except Exception as exc:  # noqa: BLE001
+            frames[key] = None
+            frames["status"] = f"Could not read {path.name}: {exc}"
+    return frames
+
+
+# ---------------------------------------------------------------------------
+# Small pure-Python stats helpers for streaming the Monte Carlo distribution
+# (no numpy dependency required on the dashboard host).
+# ---------------------------------------------------------------------------
+def _mean(xs: list) -> float:
+    return sum(xs) / len(xs) if xs else 0.0
+
+
+def _percentile(xs: list, p: float) -> float:
+    if not xs:
+        return 0.0
+    s = sorted(xs)
+    k = (len(s) - 1) * (p / 100.0)
+    f = int(k)
+    c = min(f + 1, len(s) - 1)
+    if f == c:
+        return float(s[f])
+    return float(s[f] + (s[c] - s[f]) * (k - f))
+
+
+def _peak_temp_hist_data(temps: list, bins: int = 14):
+    """Builds an ordered peak-cargo-temperature histogram for a live bar chart.
+    Returns a pandas DataFrame (ordered by temperature bin) when pandas is
+    available, else an ordered dict; None if there's nothing to plot."""
+    if not temps:
+        return None
+    lo = min(temps)
+    hi = max(temps)
+    if hi - lo < 1e-6:
+        hi = lo + 1.0
+    width = (hi - lo) / bins
+    labels = [f"{lo + i * width:.1f}" for i in range(bins)]
+    counts = [0] * bins
+    for t in temps:
+        idx = min(int((t - lo) / width), bins - 1)
+        counts[idx] += 1
+    if pd is not None:
+        return pd.DataFrame({"Peak cargo °C": labels, "Trials": counts}).set_index("Peak cargo °C")
+    return {labels[i]: counts[i] for i in range(bins)}
+
+
+# ---------------------------------------------------------------------------
 # Tabs
 # ---------------------------------------------------------------------------
-tab_dispatch, tab_field_report, tab_weather = st.tabs(
-    ["🚛 Fleet Dispatch Hub", "📝 Driver Ground-Truth Form", "🌤️ Route Weather Analytics"]
+tab_tracker, tab_report_desk, tab_prediction, tab_ai_report, tab_weather = st.tabs(
+    [
+        "🛰️ Customer Route Tracker",
+        "📝 Driver Reporting Desk",
+        "🔮 Journey Prediction & Scheduling",
+        "📊 Report",
+        "🌤️ Weather",
+    ]
 )
 
 
-# ---------------------------------------------------------------------------
-# TAB A — Fleet Dispatch Hub (fragment-isolated live polling)
-# ---------------------------------------------------------------------------
-with tab_dispatch:
-    st.title("Northern Cape Fleet Dispatch Hub")
-    st.caption("Live spoilage-risk-optimized routing for cold-chain fisheries transport.")
+# ===========================================================================
+# TAB 1 — Customer Route Tracker
+# ===========================================================================
+with tab_tracker:
+    st.title("🛰️ Customer Route Tracker")
+    st.caption("Live vehicle position, cargo condition, and compressor workload — updating as the truck moves.")
 
     if not st.session_state.trip_configured:
-        st.info("Set a starting point and destination in the sidebar, then start the trip to see live routing.")
+        st.info("Set a starting point and destination in the sidebar, then start the trip to see live tracking.")
     else:
-
-        # --- Live map: rendered ONCE as a self-contained Leaflet component
-        # that polls the backend directly from the browser and moves the
-        # truck marker with a CSS transition. This is what was glitching:
-        # a folium map gets fully rebuilt into a fresh iframe on every poll,
-        # which flashes/reloads visibly. A plain Streamlit rerun (trip
-        # reconfigured, tab reopened) rebuilds this once; the fragment below
-        # never touches it, so it never flickers again.
         initial_routing = backend_get("/v1/routing/truck-01", silent=True)
         initial_telematics = backend_get("/v1/telematics/truck-01", silent=True)
-        st.subheader("Live Route Map")
+
+        st.subheader("Live Vehicle Map")
         if initial_telematics is None or initial_telematics.get("lat") is None:
-            st.warning("No position available yet.")
+            st.warning("No position available yet. Make sure live_backend.py is running (and, in hardware mode, that Traccar Client has sent a fix).")
         else:
             render_live_map(initial_routing, initial_telematics)
             legend_cols = st.columns(2)
@@ -497,331 +611,141 @@ with tab_dispatch:
                 unsafe_allow_html=True,
             )
 
-        # --- Embedded AI Cognitive Strategy Layer ---------------------------
-        # Sits directly beneath the live map. Purely on-demand: it never
-        # fires automatically and never touches the polling fragment below,
-        # so it can't add latency or flicker to the live map/metrics. The
-        # first click is slow (the local model loads then); every click
-        # after that is fast, since the backend caches it in memory.
-        st.markdown("---")
-        st.subheader("🧠 Embedded AI Cognitive Strategy Layer")
-
-        strategy_routing = backend_get("/v1/routing/truck-01", silent=True)
-        strategy_telematics = backend_get("/v1/telematics/truck-01", silent=True)
-
-        if strategy_routing is None or strategy_routing.get("trip_plan") is None:
-            st.caption("Trip plan unavailable yet — start a trip to generate a strategy report.")
-        else:
-            st.caption(
-                "Sends this trip's fixed planning KPIs to a locally hosted Qwen2.5-1.5B model "
-                "and returns a business-strategy memo. Runs entirely on-box; the first report "
-                "may take a minute or two while the model loads."
-            )
-            if st.button("💡 Generate AI Business Strategy Report", use_container_width=True):
-                trip_plan = strategy_routing["trip_plan"]
-                plan_bv = trip_plan["business_value"]
-                optimized_route = trip_plan["optimized_route"]
-
-                # The road classes (fclass) actually present along the
-                # optimized route, for the wear-and-tear discussion.
-                surface_classes = sorted({
-                    (seg.get("fclass") or "unknown") for seg in optimized_route.get("segments", [])
-                })
-                surface_profile = ", ".join(surface_classes) if surface_classes else "unknown"
-
-                mechanical_risk_reduction_pct = (
-                    plan_bv["standard_spoilage_risk_pct"] - plan_bv["optimized_spoilage_risk_pct"]
-                )
-                thermal_risk_pct = (strategy_telematics or {}).get("thermal_risk_pct", 0.0)
-                cargo_temp_status = (strategy_telematics or {}).get("cargo_temp_status", "Unknown")
-                strategy_ambient = (strategy_telematics or {}).get("ambient_weather") or {}
-
-                strategy_payload = {
-                    "origin": trip_plan.get("origin_town") or "Current live position",
-                    "destination": trip_plan.get("destination_town", ""),
-                    "standard_time_mins": trip_plan["standard_route"]["total_time_mins"],
-                    "optimized_time_mins": optimized_route["total_time_mins"],
-                    "rand_saved": plan_bv["rand_saved"],
-                    "mechanical_risk_reduction_pct": round(mechanical_risk_reduction_pct, 1),
-                    "thermal_risk_pct": thermal_risk_pct,
-                    "cargo_temp_status": cargo_temp_status,
-                    "surface_profile": surface_profile,
-                    "shipment_value_rand": plan_bv["shipment_value_rand"],
-                    "ambient_temp_c": strategy_ambient.get("temp_c"),
-                    "rain_mm": strategy_ambient.get("rain_mm"),
-                    "weather_alert": strategy_ambient.get("alert"),
-                }
-
-                logger.info(
-                    "AI STRATEGY REQUEST -> dispatching trip-plan metrics to backend: %s",
-                    strategy_payload,
-                )
-
-                # CPU inference on a 1.5B model generating up to 700 tokens took
-                # ~3m12s in testing — 180s wasn't enough headroom and cut it off
-                # right before it finished. Generous margin here on purpose.
-                STRATEGY_TIMEOUT_SECONDS = 600
-                with st.spinner("🤖 Local model compiling econometric recommendations... (typically 2-4 minutes on CPU)"):
-                    strategy_result = backend_post(
-                        "/v1/analytics/strategy", json_body=strategy_payload, timeout=STRATEGY_TIMEOUT_SECONDS
-                    )
-
-                if strategy_result is not None:
-                    if strategy_result.get("status") == "success":
-                        st.markdown(strategy_result["strategy_markdown"])
-                        logger.info(
-                            "AI STRATEGY REPORT -> received %d characters from model '%s'",
-                            len(strategy_result["strategy_markdown"]), strategy_result.get("model", "?"),
-                        )
-                    else:
-                        st.error(strategy_result.get("message", "AI strategy generation failed."))
-                        logger.warning(
-                            "AI STRATEGY REPORT -> backend returned error_type=%s",
-                            strategy_result.get("error_type"),
-                        )
-
         st.divider()
+        st.subheader("Live Vehicle Telemetry")
 
-        # --- One-time layout scaffold ----------------------------------
-        # Built once per OUTER script run (page load, trip (re)configured,
-        # threshold changed, etc. — all infrequent) and captured by closure
-        # in dispatch_metrics_view() below. The fragment's run_every ticks
-        # only re-execute that inner function, never this scaffold, so it
-        # never calls st.columns()/st.subheader()/st.metric() at the top
-        # level on every poll — it only calls .metric()/.markdown()/etc. on
-        # these SAME placeholder objects. That's the actual fix: calling
-        # st.columns() or st.metric() fresh every ~2s poll rebuilds those
-        # DOM nodes from scratch each cycle, which is what reads as a
-        # blink. Updating an existing placeholder in place just patches its
-        # content, so the layout never flashes. (Deliberately NOT stashed
-        # in session_state — these DeltaGenerator handles are only valid
-        # for this script run, so they're rebuilt fresh, cheaply, every
-        # time this outer code runs, and simply closed over by the fragment.)
-        ui: dict = {"warning": st.empty()}
-
-        ui["plan_wrap"] = st.empty()
-
-        ui["live_header"] = st.empty()
-        live_cols = st.columns(2)
-        ui["live_eta"] = live_cols[0].empty()
-        ui["live_risk"] = live_cols[1].empty()
-        st.divider()
-
-        ui["cargo_header"] = st.empty()
-        cargo_cols = st.columns(4)
-        ui["cargo_temp"] = cargo_cols[0].empty()
-        ui["cargo_mech"] = cargo_cols[1].empty()
-        ui["cargo_thermal"] = cargo_cols[2].empty()
-        ui["cargo_value"] = cargo_cols[3].empty()
-        ui["cargo_alert"] = st.empty()
-
-        ui["chart"] = st.empty()
-        ui["chart_caption"] = st.empty()
-        st.divider()
-
-        tel_cols = st.columns(4)
-        ui["tel_vehicle"] = tel_cols[0].empty()
-        ui["tel_coords"] = tel_cols[1].empty()
-        ui["tel_temp"] = tel_cols[2].empty()
-        ui["tel_fourth"] = tel_cols[3].empty()
-
-        ui["feed"] = st.empty()
-        ui["updated"] = st.empty()
+        # One-time layout scaffold (see the original dashboard's note): built
+        # once per outer run, updated in place by the fragment so the metric
+        # cards never flash on each poll.
+        tracker_ui: dict = {"warning": st.empty()}
+        card_cols = st.columns(4)
+        tracker_ui["vehicle"] = card_cols[0].empty()
+        tracker_ui["coords"] = card_cols[1].empty()
+        tracker_ui["cargo_temp"] = card_cols[2].empty()
+        tracker_ui["compressor"] = card_cols[3].empty()
+        tracker_ui["status_banner"] = st.empty()
+        tracker_ui["chart_header"] = st.empty()
+        tracker_ui["chart"] = st.empty()
+        tracker_ui["chart_caption"] = st.empty()
+        tracker_ui["feed"] = st.empty()
+        tracker_ui["updated"] = st.empty()
 
         @st.fragment(run_every=POLL_INTERVAL_SECONDS)
-        def dispatch_metrics_view():
+        def tracker_metrics_view():
             telematics = backend_get("/v1/telematics/truck-01", silent=True)
-            routing = backend_get("/v1/routing/truck-01", silent=True)
-
-            if telematics is None:
-                ui["warning"].warning("No telemetry received yet. Make sure live_backend.py is running.")
+            if telematics is None or telematics.get("lat") is None:
+                tracker_ui["warning"].warning("No telemetry received yet.")
+                # A placeholder created in the scaffold must be written on every
+                # run (incl. the first) or a later fragment-only rerun raises
+                # "container not written to during the initial run".
+                tracker_ui["chart"].line_chart({"Cargo Temp (°C)": [float(st.session_state.safe_temp_max_c)]}, height=220)
                 return
-            ui["warning"].empty()
+            tracker_ui["warning"].empty()
 
-            feed_source = telematics.get("feed_source", "UNKNOWN")
-            arrived = telematics.get("arrived", False)
-            progress_pct = telematics.get("trip_progress_pct")
+            vehicle_id = telematics.get("vehicle_id", "—")
+            lat = telematics.get("lat", 0.0)
+            lon = telematics.get("lon", 0.0)
             cargo_temp_c = telematics.get("cargo_temp_c", 0.0)
+            compressor = telematics.get("compressor_load_pct")
             temp_status = telematics.get("cargo_temp_status", "Unknown")
+            feed_source = telematics.get("feed_source", "UNKNOWN")
 
-            # --- Trip Plan: fixed full-journey baseline, cached once when the
-            # trip was configured. Doesn't change as the truck drives — that's
-            # the point, it's what "Live Remaining" below is measured against.
-            # Rendered into a single placeholder container, so switching it
-            # on/off (or refreshing identical values) never reshapes the
-            # rest of the layout.
-            trip_plan = routing.get("trip_plan") if routing is not None else None
-            if trip_plan is not None:
-                with ui["plan_wrap"].container():
-                    st.subheader("Trip Plan (fixed at departure)")
-                    plan_bv = trip_plan["business_value"]
-                    plan_cols = st.columns(3)
-                    plan_cols[0].metric(
-                        "Planned ETA (optimized)", f"{trip_plan['optimized_route']['total_time_mins']:.0f} min"
-                    )
-                    plan_cols[1].metric("Time Cost vs Standard", f"{-plan_bv['time_saved_mins']:+.0f} min")
-                    plan_cols[2].metric(
-                        "Planned Spoilage Risk Avoided",
-                        f"{plan_bv['standard_spoilage_risk_pct'] - plan_bv['optimized_spoilage_risk_pct']:.1f} pts",
-                    )
-                    st.divider()
-            else:
-                ui["plan_wrap"].empty()
+            safe_baseline = float(st.session_state.safe_temp_max_c)
 
-            # --- Live Remaining: recomputed from the truck's CURRENT position
-            # on every poll — this is what used to be frozen at the full-trip
-            # value all the way through the drive; it now genuinely shrinks.
-            # Same "must write every run" rule as the chart below: give the
-            # else branch something to write too, so these three placeholders
-            # are never skipped on a run (e.g. a transient routing hiccup)
-            # only to be written for the first time on a later fragment-only
-            # rerun.
-            if routing is not None:
-                bv = routing["business_value"]
-                optimized = routing["optimized_route"]
-
-                ui["live_header"].subheader("Live Remaining Route")
-                ui["live_eta"].metric("Remaining ETA (optimized)", f"{optimized['total_time_mins']:.0f} min")
-                ui["live_risk"].metric(
-                    "Remaining Spoilage Risk Avoided",
-                    f"{bv['standard_spoilage_risk_pct'] - bv['optimized_spoilage_risk_pct']:.1f} pts",
-                    help=f"Optimized: {bv['optimized_spoilage_risk_pct']:.1f}% risk vs "
-                         f"Standard: {bv['standard_spoilage_risk_pct']:.1f}% risk, for the route "
-                         f"from where the truck is right now to the destination.",
-                )
-            else:
-                ui["live_header"].subheader("Live Remaining Route")
-                ui["live_eta"].metric("Remaining ETA (optimized)", "n/a")
-                ui["live_risk"].metric("Remaining Spoilage Risk Avoided", "n/a")
-
-            # --- Cargo Condition: what's actually happening to the shipment,
-            # driven by cargo_temp_c (mechanical risk = road damage already
-            # driven over; thermal risk = temperature exposure accumulated so
-            # far). Replace cargo_temp_c's source with a real reefer sensor
-            # feed via /v1/telematics/incoming once hardware is wired up —
-            # everything downstream of that one number already works.
-            ui["cargo_header"].subheader("Cargo Condition")
-            ui["cargo_temp"].metric("Cargo Temperature", f"{cargo_temp_c:.1f} C")
-            mech_risk = telematics.get("mechanical_risk_pct")
-            ui["cargo_mech"].metric(
-                "Mechanical Risk (roads so far)",
-                f"{mech_risk:.1f}%" if mech_risk is not None else "n/a",
-                help="Road-roughness damage accrued on the distance already driven. "
-                     "Only tracked in Simulator mode, which has a fixed planned route.",
+            tracker_ui["vehicle"].metric("Active Vehicle ID", vehicle_id)
+            tracker_ui["coords"].metric("Current GPS Coordinates", f"{lat:.4f}, {lon:.4f}")
+            tracker_ui["cargo_temp"].metric(
+                "Emulated Cargo Temp", f"{cargo_temp_c:.1f} °C",
+                delta=f"{cargo_temp_c - safe_baseline:+.1f} °C vs baseline",
+                delta_color="inverse",
+                help=f"Safe baseline is {safe_baseline:.1f} °C (set it in the sidebar).",
             )
-            ui["cargo_thermal"].metric(
-                "Thermal Risk (heat so far)",
-                f"{telematics.get('thermal_risk_pct', 0):.1f}%",
-                help="Temperature-exposure damage accrued so far, integrated over elapsed time.",
-            )
-            ui["cargo_value"].metric(
-                "Value at Risk So Far",
-                f"R {telematics.get('expected_loss_rand_so_far', 0):,.0f}",
-                help="Composite (mechanical + thermal) risk applied to the shipment value.",
+            tracker_ui["compressor"].metric(
+                "Compressor Workload",
+                f"{compressor:.0f}%" if compressor is not None else "n/a",
+                help="Reefer condenser load. Pinned to 100% while the vehicle is stationary (queue/gridlock) to model condenser strain in desert heat.",
             )
 
+            # Explicit baseline-crossing alert (spec: warn the user the moment
+            # cargo passes the safe baseline they set). Critical/Elevated both
+            # mean the cargo is above baseline and at risk; Nominal is at/below.
             if temp_status == "Awaiting Motion":
-                ui["cargo_alert"].info(
-                    f"⏸️ Truck parked at {cargo_temp_c:.1f} C — cargo risk metrics are frozen until it "
-                    f"starts moving, so a stationary shipment doesn't silently accrue spoilage risk "
-                    f"before it's actually departed."
-                )
+                tracker_ui["status_banner"].info(f"⏸️ Truck parked at {cargo_temp_c:.1f} °C — cargo metrics frozen until it departs.")
             elif temp_status == "Critical":
-                ui["cargo_alert"].error(
-                    f"Cargo temperature CRITICAL at {cargo_temp_c:.1f} C — thermal spoilage risk is "
-                    f"accelerating (composite risk {telematics.get('composite_cargo_risk_pct', 0):.1f}%)."
+                tracker_ui["status_banner"].error(
+                    f"🛑 CARGO AT RISK — temperature {cargo_temp_c:.1f} °C is CRITICALLY above your "
+                    f"{safe_baseline:.1f} °C safe baseline (+{cargo_temp_c - safe_baseline:.1f} °C). "
+                    f"Thermal spoilage risk is accelerating."
                 )
             elif temp_status == "Elevated":
-                ui["cargo_alert"].warning(
-                    f"Cargo temperature elevated at {cargo_temp_c:.1f} C — above the "
-                    f"{st.session_state.safe_temp_max_c:.1f} C safe threshold, "
-                    f"spoilage risk is accruing faster than baseline."
+                tracker_ui["status_banner"].warning(
+                    f"⚠️ CARGO AT RISK — temperature {cargo_temp_c:.1f} °C has passed your "
+                    f"{safe_baseline:.1f} °C safe baseline (+{cargo_temp_c - safe_baseline:.1f} °C). "
+                    f"Spoilage risk is now accruing faster than baseline."
                 )
             else:
-                ui["cargo_alert"].success(f"Cargo temperature nominal at {cargo_temp_c:.1f} C.")
+                tracker_ui["status_banner"].success(
+                    f"✅ Cargo temperature nominal at {cargo_temp_c:.1f} °C (safe baseline {safe_baseline:.1f} °C)."
+                )
 
-            # --- Live temperature history chart -----------------------------
-            # Only appends while the trip is genuinely underway: not yet
-            # arrived, AND (for hardware mode) actually moving. Without the
-            # "arrived" check it kept appending forever after the trip
-            # finished; without the "awaiting motion" check it did the same
-            # for a truck that was simply parked and hadn't departed yet —
-            # in both cases the chart never settled and kept scrolling even
-            # though nothing was actually changing.
+            # --- Live cold-chain temperature chart with the safe baseline -----
+            # Appends one point per poll while the trip is genuinely underway
+            # (not arrived, and — in hardware mode — actually moving), so a
+            # parked or finished truck doesn't keep scrolling a flat line.
+            arrived = telematics.get("arrived", False)
             awaiting_motion = telematics.get("awaiting_motion", False)
             if not arrived and not awaiting_motion:
                 st.session_state.temp_history.append({
                     "poll": len(st.session_state.temp_history),
-                    "Cargo Temp (C)": cargo_temp_c,
+                    "Cargo Temp (°C)": cargo_temp_c,
                 })
-                st.session_state.temp_history = st.session_state.temp_history[-200:]  # cap buffer length
+                st.session_state.temp_history = st.session_state.temp_history[-200:]
 
-            # ui["chart"] MUST be written to on every single run of this
-            # fragment, including the very first one — a placeholder created
-            # outside a fragment (st.empty(), in the scaffold above) has to
-            # be claimed by an actual call during the run that creates it,
-            # or Streamlit can't reserve a stable position for it. Gating
-            # this behind "len(temp_history) >= 2" meant that on the very
-            # first poll (0 or 1 points collected so far), the chart
-            # placeholder was left untouched; the first time a LATER,
-            # fragment-only rerun tried to draw into it, Streamlit raised
-            # "container was not written to during the initial run". Always
-            # drawing something — even a single-point placeholder chart —
-            # keeps the slot claimed from run one, so later reruns can just
-            # update it in place.
-            if len(st.session_state.temp_history) >= 2:
-                chart_data = {
-                    row["poll"]: row["Cargo Temp (C)"] for row in st.session_state.temp_history
-                }
-                ui["chart"].line_chart(chart_data, height=180)
-                if arrived:
-                    ui["chart_caption"].caption(
-                        f"🏁 Trip complete — cargo temperature history frozen at arrival "
-                        f"(safe threshold: {st.session_state.safe_temp_max_c:.1f} C)."
+            tracker_ui["chart_header"].subheader("Cold-Chain Temperature vs Safe Baseline")
+            history = st.session_state.temp_history
+            if len(history) >= 1:
+                if pd is not None:
+                    chart_df = pd.DataFrame(history).set_index("poll")
+                    chart_df["Safe Baseline (°C)"] = safe_baseline
+                    tracker_ui["chart"].line_chart(
+                        chart_df[["Cargo Temp (°C)", "Safe Baseline (°C)"]], height=220,
                     )
                 else:
-                    ui["chart_caption"].caption(
-                        f"Live cargo temperature over the session "
-                        f"(safe threshold: {st.session_state.safe_temp_max_c:.1f} C). "
-                        "This is exactly where a real reefer-unit sensor feed would plug in."
+                    tracker_ui["chart"].line_chart(
+                        {"Cargo Temp (°C)": [h["Cargo Temp (°C)"] for h in history]}, height=220,
+                    )
+                if arrived:
+                    tracker_ui["chart_caption"].caption(
+                        f"🏁 Trip complete — cargo temperature history frozen at arrival. "
+                        f"Flat line = your {safe_baseline:.1f} °C safe baseline; any excursion above it is spoilage-risk exposure."
+                    )
+                else:
+                    tracker_ui["chart_caption"].caption(
+                        f"Live cargo temperature (updating as the truck moves) against your {safe_baseline:.1f} °C safe baseline. "
+                        "When the cargo line rises above the baseline, the banner above turns to a risk warning."
                     )
             else:
-                ui["chart"].line_chart({0: cargo_temp_c}, height=180)
-                ui["chart_caption"].caption("Collecting cargo temperature history…")
-
-            # --- Telemetry metrics -----------------------------------------
-            ui["tel_vehicle"].metric("Vehicle ID", telematics.get("vehicle_id", "—"))
-            ui["tel_coords"].metric(
-                "Current Coordinates",
-                f"{telematics.get('lat', 0):.4f}, {telematics.get('lon', 0):.4f}",
-            )
-            ui["tel_temp"].metric("Cargo Temperature", f"{cargo_temp_c:.1f} C")
-            if progress_pct is not None:
-                ui["tel_fourth"].metric("Trip Progress", f"{progress_pct:.0f}%")
-            elif routing is not None:
-                ui["tel_fourth"].metric(
-                    "Spoilage Cost Index", f"{routing['optimized_route']['total_spoilage_cost']:.2f}",
-                )
-            else:
-                ui["tel_fourth"].metric("Trip Progress", "n/a")
+                tracker_ui["chart"].line_chart({"Cargo Temp (°C)": [cargo_temp_c]}, height=220)
+                tracker_ui["chart_caption"].caption("Collecting cargo temperature history…")
 
             if feed_source == FEED_SOURCE_REAL:
-                ui["feed"].success(f"Data Feed Source: {feed_source}")
+                tracker_ui["feed"].success(f"Data Feed Source: {feed_source}")
             elif feed_source == FEED_SOURCE_SIMULATED:
-                ui["feed"].info(f"Data Feed Source: {feed_source}" + ("  |  Arrived at destination" if arrived else ""))
+                arrived = telematics.get("arrived", False)
+                tracker_ui["feed"].info(f"Data Feed Source: {feed_source}" + ("  |  Arrived at destination" if arrived else ""))
             else:
-                ui["feed"].warning(f"Data Feed Source: {feed_source}")
+                tracker_ui["feed"].warning(f"Data Feed Source: {feed_source}")
 
-            ui["updated"].caption(f"Last updated: {datetime.now().strftime('%H:%M:%S')}")
+            tracker_ui["updated"].caption(f"Last updated: {datetime.now().strftime('%H:%M:%S')}")
 
-        dispatch_metrics_view()
+        tracker_metrics_view()
 
 
-# ---------------------------------------------------------------------------
-# TAB B — Driver Ground-Truth Form (outside the fragment, never rerun by polling)
-# ---------------------------------------------------------------------------
-with tab_field_report:
-    st.title("Driver Ground-Truth Report")
+# ===========================================================================
+# TAB 2 — Driver Reporting Desk
+# ===========================================================================
+with tab_report_desk:
+    st.title("📝 Driver Reporting Desk")
     st.caption(
         "Submit a real-time road condition update. Reports override the routing "
         "impedance for the matched segment immediately — the next routing "
@@ -835,10 +759,8 @@ with tab_field_report:
         default_lat = last_telematics.get("lat")
         default_lon = last_telematics.get("lon")
 
-    # Outside the form on purpose: widgets inside st.form don't trigger a
-    # rerun until submit, so a checkbox in there couldn't reveal the storm
-    # dropdown live. Placed here, toggling it reruns the script immediately
-    # and the form below picks up its current value on that same rerun.
+    # Outside the form on purpose: a checkbox inside st.form wouldn't reveal the
+    # storm dropdown until submit. Placed here, toggling it reruns immediately.
     is_storm_report = st.checkbox(
         "⛈️ Report Severe Storm / Active Washout Structural Damage",
         help=(
@@ -933,26 +855,553 @@ with tab_field_report:
             )
 
 
-# ---------------------------------------------------------------------------
-# TAB C — Route Weather Analytics (live ambient climate + forecast along path)
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# TAB 3 — Journey Prediction & Scheduling
+# ===========================================================================
+with tab_prediction:
+    st.title("🔮 Journey Prediction & Scheduling")
+    st.caption(
+        "Plan a future departure up to 7 days out: preview synthetic sensor streams "
+        "frame-by-frame, run a Monte Carlo stochastic risk test, and compare departure "
+        "slots on their cold-chain failure probability."
+    )
+
+    # --- Temporal controller (7-day future window) --------------------------
+    st.subheader("Departure Window")
+    today = date.today()
+    # Contiguous 7-day-forward window rendered as an explicit day list — no
+    # greyed-out calendar days, no month jumps: every option is selectable and
+    # adjacent to the next. (The old calendar's min/max greying is what read as
+    # "some dates not available / jumps".)
+    day_options = [today + timedelta(days=i) for i in range(PREDICTION_MAX_HORIZON_DAYS + 1)]
+
+    def _fmt_day(d):
+        n = (d - today).days
+        tag = "Today" if n == 0 else ("Tomorrow" if n == 1 else f"+{n} days")
+        return f"{d.strftime('%a %d %b %Y')} · {tag}"
+
+    ctrl_cols = st.columns([2, 1])
+    dep_date = ctrl_cols[0].selectbox(
+        "Departure date (next 7 days)", options=day_options, index=0, format_func=_fmt_day,
+        help="Contiguous 7-day forward window (the OpenWeatherMap free-tier forecast horizon).",
+    )
+    dep_time = ctrl_cols[1].time_input("Departure time", value=dt_time(hour=6, minute=0))
+
+    pred_origin = None
+    pred_destination = None
+    if AVAILABLE_TOWNS:
+        od_cols = st.columns(2)
+        pred_origin = od_cols[0].selectbox(
+            "Prediction origin", options=AVAILABLE_TOWNS, index=_town_index(st.session_state.active_origin)
+        )
+        st.session_state.active_origin = pred_origin
+        pred_destination = od_cols[1].selectbox(
+            "Prediction destination", options=AVAILABLE_TOWNS, index=_town_index(st.session_state.active_destination)
+        )
+        st.session_state.active_destination = pred_destination
+    else:
+        st.warning("Backend unreachable — cannot load town list for prediction.")
+
+    departure_dt = datetime.combine(dep_date, dep_time)
+    # The backend rejects a target in the past or > 7 days out. If the chosen
+    # local time has already passed today, clamp the API target a couple of
+    # minutes into the future so the request still succeeds; the caption keeps
+    # showing exactly what the user picked.
+    _now_utc = datetime.utcnow()
+    api_target_dt = departure_dt if departure_dt > _now_utc + timedelta(minutes=1) else _now_utc + timedelta(minutes=2)
+    api_target_iso = api_target_dt.isoformat()
+    st.caption(f"Planned departure: **{departure_dt.strftime('%A %d %B %Y, %H:%M')}** (interpreted as UTC by the backend).")
+    if st.session_state.trip_configured and st.session_state.last_config:
+        cfg = st.session_state.last_config
+        active_od = f"{cfg['origin']} → {cfg['destination']}" if cfg["origin"] else f"Live position → {cfg['destination']}"
+        st.caption(
+            f"ℹ️ Defaults match your active trip (**{active_od}**). Prediction, the Customer Route Tracker, "
+            "and the live hardware feed all run the **same** spoilage-optimized shortest-path engine on the "
+            "same road graph, so the optimal route shown here is consistent with the one being tracked live "
+            "(the live tracker simply re-solves it from the truck's current position instead of the origin town)."
+        )
+
+    st.divider()
+
+    # --- Ingestion ticker over the synthetic Stream A/B/C CSVs --------------
+    st.subheader("🎞️ Synthetic Telemetry Ingestion Ticker")
+    st.caption(
+        "Streamed frame-by-frame from synthetic_weather_forecast.csv, "
+        "synthetic_road_conditions.csv and synthetic_cold_sensors.csv, presented as if "
+        "arriving live from field hardware. Generated by vrp_simulation_generator.py."
+    )
+
+    regen = st.button("🔄 (Re)generate synthetic streams")
+    streams = ensure_synthetic_streams(force=regen)
+    if streams["status"] != "ok":
+        st.warning(streams["status"])
+    else:
+        weather_df = streams["weather"]
+        road_df = streams["road"]
+        sensor_df = streams["sensor"]
+        max_frame = min(
+            len(weather_df) if weather_df is not None else 0,
+            len(road_df) if road_df is not None else 0,
+            len(sensor_df) if sensor_df is not None else 0,
+        )
+        if max_frame < 1:
+            st.warning("Synthetic streams are empty — try regenerating them.")
+        else:
+            frame = st.slider(
+                "🎞️ Advance Predictive Journey Frame",
+                min_value=0, max_value=max_frame - 1, value=0,
+                help="Scrub through the synthetic forecast hour-by-hour; the metric cards below update as if streaming live from hardware.",
+            )
+            w_row = weather_df.iloc[frame]
+            r_row = road_df.iloc[frame]
+            s_row = sensor_df.iloc[frame]
+
+            st.caption(f"Frame {frame} · forecast timestamp {w_row['timestamp_iso']}")
+            frame_cols = st.columns(4)
+            frame_cols[0].metric("Ambient Temp", f"{float(w_row['ambient_temp_c']):.1f} °C")
+            frame_cols[1].metric("Rain", f"{float(w_row['rain_mm_per_hr']):.1f} mm/hr")
+            frame_cols[2].metric("Cargo Temp (Stream C)", f"{float(s_row['cargo_temp_c']):.1f} °C")
+            frame_cols[3].metric("Compressor Load", f"{float(s_row['compressor_load_pct']):.0f}%")
+
+            frame_cols2 = st.columns(4)
+            frame_cols2[0].metric("Road Condition", str(r_row["condition_label"]))
+            frame_cols2[1].metric("Safe Speed", f"{float(r_row['safe_speed_kmh']):.0f} km/h")
+            frame_cols2[2].metric("IRI (Roughness)", f"{float(r_row['iri']):.2f}")
+            frame_cols2[3].metric("G-Force RMS", f"{float(s_row['g_force_rms']):.2f} g")
+
+            if bool(r_row["failure_event"]):
+                st.error(f"🛑 Failure event this frame — {r_row['condition_label']} (trigger: {r_row['trigger']}). Edge weight ×{float(r_row['edge_weight_multiplier']):.2f}; router reroutes to an optimal path.")
+            elif bool(s_row["spoilage_breach"]):
+                st.warning(f"⚠️ Cargo has breached −18.0 °C at this frame (cargo temp {float(s_row['cargo_temp_c']):.1f} °C).")
+            else:
+                st.success("✅ Nominal conditions this frame.")
+
+    st.divider()
+
+    # --- Monte Carlo stochastic risk test ----------------------------------
+    st.subheader("🎲 Monte Carlo Stochastic Risk Test")
+    st.caption(
+        "Runs the backend/vrp Monte Carlo solver: per-trial thermal variance N(0, 2.5 °C), "
+        "Vioolsdrift customs delay 300 min + N(0, 45), and a 5% infrastructure-shock "
+        "probability, tracking cargo temperature via a Newtonian cooling model."
+    )
+    mc_cols = st.columns([1, 2])
+    mc_iterations = mc_cols[0].select_slider(
+        "Trials", options=[200, 500, 1000, 2000], value=1000,
+        help="More trials = tighter estimates but a slower run.",
+    )
+
+    if st.button("🎲 Run Monte Carlo Stochastic Risk Test", use_container_width=True):
+        if not (pred_origin and pred_destination):
+            st.error("Select a prediction origin and destination first.")
+        elif pred_origin == pred_destination:
+            st.error("Origin and destination must differ.")
+        else:
+            # Stream the simulation: split the run into batches and update a
+            # progress bar, the metric cards, and a growing peak-temperature
+            # histogram after each batch, so the user watches the distribution
+            # build in real time instead of staring at a frozen button.
+            total = int(mc_iterations)
+            n_batches = max(1, min(10, total // 100))  # each batch ≥ 100 (backend minimum)
+            base = total // n_batches
+            batch_sizes = [base] * (n_batches - 1) + [total - base * (n_batches - 1)]
+
+            st.markdown(f"**{pred_origin} → {pred_destination}** · streaming {total:,} trials")
+            progress = st.progress(0.0, text="Starting Monte Carlo…")
+            live_cols = st.columns(3)
+            live_dur = live_cols[0].empty()
+            live_var = live_cols[1].empty()
+            live_prob = live_cols[2].empty()
+            live_hist = st.empty()
+            live_caption = st.empty()
+
+            acc_peak: list = []
+            acc_loss: list = []
+            acc_journey: list = []
+            last_res = None
+            run_ok = True
+            done = 0
+
+            for bsize in batch_sizes:
+                res = backend_post(
+                    "/v1/simulation/monte-carlo-risk",
+                    json_body={
+                        "origin_town": pred_origin,
+                        "destination_town": pred_destination,
+                        "target_datetime": api_target_iso,
+                        "shipment_value_rand": float(st.session_state.shipment_value_rand),
+                        "iterations": int(bsize),
+                        "return_samples": True,
+                    },
+                    timeout=120.0,
+                )
+                if res is None or res.get("status") != "success":
+                    run_ok = False
+                    st.error((res or {}).get("message", "Monte Carlo simulation failed."))
+                    break
+                last_res = res
+                acc_peak += res.get("sample_peak_temps_c", [])
+                acc_loss += res.get("sample_losses_rand", [])
+                acc_journey += res.get("sample_journey_hours", [])
+                done += bsize
+
+                exp_min = _mean(acc_journey) * 60.0
+                var95 = _percentile(acc_loss, 95)
+                prob = (sum(1 for t in acc_peak if t > -18.0) / len(acc_peak) * 100.0) if acc_peak else 0.0
+                progress.progress(done / total, text=f"Simulating cold-chain trials… {done:,}/{total:,}")
+                live_dur.metric("Expected Journey Duration", f"{exp_min:.0f} min")
+                live_var.metric("95% Value at Risk", f"R {var95:,.0f}")
+                live_prob.metric("Prob. of Cold-Chain Failure", f"{prob:.1f}%")
+                hist_data = _peak_temp_hist_data(acc_peak)
+                if hist_data is not None:
+                    live_hist.bar_chart(hist_data, height=200)
+                live_caption.caption(
+                    f"Peak cargo-temperature distribution over {len(acc_peak):,} trials so far — "
+                    "anything to the right of −18.0 °C is a spoiled load."
+                )
+
+            if run_ok and last_res is not None:
+                progress.progress(1.0, text=f"Done — {total:,} trials complete.")
+                aggregated = dict(last_res)
+                aggregated["origin_town"] = pred_origin
+                aggregated["destination_town"] = pred_destination
+                aggregated["expected_journey_time_mins"] = round(_mean(acc_journey) * 60.0, 1)
+                aggregated["expected_journey_time_hours"] = round(_mean(acc_journey), 2)
+                aggregated["value_at_risk_95_rand"] = round(_percentile(acc_loss, 95), -2) if acc_loss else 0.0
+                aggregated["prob_total_spoilage_pct"] = (
+                    round(sum(1 for t in acc_peak if t > -18.0) / len(acc_peak) * 100.0, 2) if acc_peak else 0.0
+                )
+                aggregated["mean_peak_cargo_temp_c"] = round(_mean(acc_peak), 2) if acc_peak else 0.0
+                aggregated["worst_peak_cargo_temp_c"] = round(max(acc_peak), 2) if acc_peak else 0.0
+                aggregated["iterations"] = len(acc_journey)
+                aggregated["sample_peak_temps_c"] = acc_peak  # kept for the persistent histogram
+                st.session_state.montecarlo_result = aggregated
+                st.rerun()
+            else:
+                st.session_state.montecarlo_result = None
+
+    mc = st.session_state.montecarlo_result
+    if mc is not None:
+        st.markdown(f"**{mc.get('origin_town','')} → {mc.get('destination_town','')}** · {mc.get('iterations','?')} trials")
+        result_cols = st.columns(3)
+        result_cols[0].metric("Expected Journey Duration", f"{mc['expected_journey_time_mins']:.0f} min",
+                              help=f"{mc['expected_journey_time_hours']:.2f} hours (drive {mc.get('route_total_drive_hours', 0):.1f} h + idle).")
+        result_cols[1].metric("95% Value at Risk", f"R {mc['value_at_risk_95_rand']:,.0f}",
+                              help="95th-percentile Rand loss across all trials, against the shipment value.")
+        result_cols[2].metric("Probability of Cold-Chain Failure", f"{mc['prob_total_spoilage_pct']:.1f}%",
+                              help=f"Share of trials where peak cargo temp breached {mc.get('spoilage_breach_temp_c', -18.0):.1f} °C.")
+
+        detail_cols = st.columns(3)
+        detail_cols[0].metric("Mean / Worst Peak Cargo Temp", f"{mc['mean_peak_cargo_temp_c']:.1f} / {mc['worst_peak_cargo_temp_c']:.1f} °C")
+        detail_cols[1].metric("Forecast Ambient", f"{mc['forecast_ambient_temp_c']:.1f} °C")
+        detail_cols[2].metric("Route Crosses Border", "Yes" if mc.get("route_crosses_border") else "No")
+
+        # Final peak-cargo-temperature distribution across all trials.
+        final_samples = mc.get("sample_peak_temps_c")
+        if final_samples:
+            st.caption(
+                "Peak cargo-temperature distribution across all trials — bars to the right of "
+                "−18.0 °C are trials where the cold chain was breached:"
+            )
+            hist_data = _peak_temp_hist_data(final_samples)
+            if hist_data is not None:
+                st.bar_chart(hist_data, height=220)
+
+        prob = mc["prob_total_spoilage_pct"]
+        if prob >= 25.0:
+            st.error(f"REJECT DEPARTURE: {prob:.0f}% Spoilage Failure Risk at this slot.")
+        elif prob >= 10.0:
+            st.warning(f"CAUTION: {prob:.0f}% Spoilage Risk — consider a cooler departure slot.")
+        else:
+            st.success(f"APPROVE DEPARTURE: {prob:.1f}% Failure Risk.")
+
+        if prob <= 0.001:
+            crosses = "Yes" if mc.get("route_crosses_border") else "No"
+            st.info(
+                f"ℹ️ **Why 0% here:** this route is driving-only (crosses Vioolsdrift border: {crosses}) in mild "
+                f"ambient (~{mc.get('forecast_ambient_temp_c', '?')} °C), so the reefer holds the cargo below "
+                "−18 °C the whole way — a genuinely low-risk shipment, not a broken result. To see risk accrue, "
+                "pick a destination whose route crosses the border, choose a hotter departure slot, or route over "
+                "unpaved segments (which raise the infrastructure-shock chance)."
+            )
+
+    st.divider()
+
+    # --- Predictive route + hazard map (streamlit_folium) ------------------
+    st.subheader("🗺️ Forecast-Aware Predictive Route")
+    st.caption("Samples the 7-day forecast along the corridor and detours around any extreme-heat or storm-washout hazard zone.")
+    if st.button("Compute forecast-aware route"):
+        if not (pred_origin and pred_destination):
+            st.error("Select a prediction origin and destination first.")
+        elif pred_origin == pred_destination:
+            st.error("Origin and destination must differ.")
+        else:
+            with st.spinner("Sampling forecast and re-solving the route..."):
+                st.session_state.predictive_route = backend_post(
+                    "/v1/simulation/predictive-route",
+                    json_body={
+                        "origin_town": pred_origin,
+                        "destination_town": pred_destination,
+                        "target_datetime": api_target_iso,
+                    },
+                    timeout=120.0,
+                )
+
+    pr = st.session_state.predictive_route
+    if pr is not None and "predictive_route" in pr:
+        pr_cols = st.columns(3)
+        pr_cols[0].metric("Hazard Zones on Corridor", pr.get("hazard_count", 0))
+        pr_cols[1].metric("Rerouted Around Hazard", "Yes" if pr.get("rerouted_around_hazard") else "No")
+        pr_cols[2].metric("Extra Time vs Baseline", f"{pr['delta_vs_baseline']['extra_time_mins']:+.0f} min")
+
+        if HAVE_FOLIUM:
+            coords = pr["predictive_route"]["coordinates"]  # [lon, lat]
+            if coords:
+                mid_lat = sum(c[1] for c in coords) / len(coords)
+                mid_lon = sum(c[0] for c in coords) / len(coords)
+                # Keyless OpenStreetMap tiles — same basemap as the Customer
+                # Route Tracker, and no CartoDB "API KEY REQUIRED" watermark.
+                fmap = folium.Map(location=[mid_lat, mid_lon], zoom_start=7, tiles="OpenStreetMap")
+                folium.PolyLine(
+                    [[c[1], c[0]] for c in coords], color=OPTIMIZED_COLOR, weight=5, opacity=0.9,
+                    tooltip="Forecast-aware optimized route",
+                ).add_to(fmap)
+                base_coords = pr["baseline_optimized_route"]["coordinates"]
+                if base_coords and pr.get("rerouted_around_hazard"):
+                    folium.PolyLine(
+                        [[c[1], c[0]] for c in base_coords], color=STANDARD_COLOR, weight=4, opacity=0.6,
+                        dash_array="6,6", tooltip="Baseline route (before hazard reroute)",
+                    ).add_to(fmap)
+                for hz in pr.get("hazard_zones", []):
+                    folium.CircleMarker(
+                        location=[hz["lat"], hz["lon"]], radius=8, color=HAZARD_COLOR, fill=True,
+                        fill_opacity=0.7,
+                        tooltip=f"{hz['reason']} — {hz['forecast_ambient_temp_c']:.0f}°C / {hz['forecast_rain_mm_per_hr']:.1f}mm",
+                    ).add_to(fmap)
+                # Origin/destination pins use a self-contained emoji DivIcon
+                # instead of folium's default marker. The default marker loads
+                # its PNG (marker-icon.png) from an external CDN, which is
+                # blocked inside the streamlit_folium iframe and renders as a
+                # broken-image square — a DivIcon is pure inline HTML, so it
+                # always shows.
+                # Icons consistent with the Customer Route Tracker: a 🚚 truck
+                # emoji at the origin (same glyph as the live vehicle marker)
+                # and a blue teardrop pin at the destination (an inline SVG that
+                # matches Leaflet's default blue marker used on the tracker, but
+                # self-contained so it can't break like an external-PNG marker).
+                _truck_icon = folium.DivIcon(
+                    html='<div style="font-size:26px;line-height:26px;text-shadow:0 0 3px #fff,0 0 3px #fff;">🚚</div>',
+                    icon_size=(28, 28), icon_anchor=(14, 14),
+                )
+                _blue_pin_svg = (
+                    '<svg xmlns="http://www.w3.org/2000/svg" width="26" height="38" viewBox="0 0 26 38">'
+                    '<path d="M13 0C5.8 0 0 5.8 0 13c0 9.8 13 25 13 25s13-15.2 13-25C26 5.8 20.2 0 13 0z" '
+                    'fill="#2A81CB" stroke="#ffffff" stroke-width="1.6"/>'
+                    '<circle cx="13" cy="13" r="5.2" fill="#ffffff"/></svg>'
+                )
+                _dest_icon = folium.DivIcon(html=_blue_pin_svg, icon_size=(26, 38), icon_anchor=(13, 38))
+                folium.Marker(
+                    [coords[0][1], coords[0][0]],
+                    tooltip=f"Origin: {pr.get('origin_town','')}",
+                    icon=_truck_icon,
+                ).add_to(fmap)
+                folium.Marker(
+                    [coords[-1][1], coords[-1][0]],
+                    tooltip=f"Destination: {pr.get('destination_town','')}",
+                    icon=_dest_icon,
+                ).add_to(fmap)
+                st_folium(fmap, height=460, use_container_width=True, returned_objects=[])
+        else:
+            st.info("Install `streamlit-folium` and `folium` to see the hazard map. Route stats are shown above.")
+
+    st.divider()
+
+    # --- Executive recommendation matrix (Monte Carlo per departure slot) ---
+    st.subheader("🧮 Executive Departure-Slot Recommendation Matrix")
+    st.caption(
+        "Runs the Monte Carlo solver for three departure windows (Now, +12h, +24h) and "
+        "ranks them by cold-chain failure probability, with a plain-language call per slot."
+    )
+    matrix_iters = st.select_slider(
+        "Trials per slot", options=[200, 400, 800], value=400,
+        help="Three slots are simulated, so a lower per-slot count keeps this responsive.",
+    )
+    if st.button("Build recommendation matrix", use_container_width=True):
+        if not (pred_origin and pred_destination):
+            st.error("Select a prediction origin and destination first.")
+        elif pred_origin == pred_destination:
+            st.error("Origin and destination must differ.")
+        else:
+            rows = []
+            slots = [("Now", 5), ("+12h", 12 * 60), ("+24h", 24 * 60)]
+            with st.spinner("Simulating each departure slot..."):
+                for label, offset_min in slots:
+                    slot_dt = datetime.utcnow() + timedelta(minutes=offset_min)
+                    slot_result = backend_post(
+                        "/v1/simulation/monte-carlo-risk",
+                        json_body={
+                            "origin_town": pred_origin,
+                            "destination_town": pred_destination,
+                            "target_datetime": slot_dt.isoformat(),
+                            "shipment_value_rand": float(st.session_state.shipment_value_rand),
+                            "iterations": int(matrix_iters),
+                        },
+                        timeout=120.0,
+                    )
+                    if slot_result is not None and slot_result.get("status") == "success":
+                        prob = slot_result["prob_total_spoilage_pct"]
+                        if prob >= 25.0:
+                            rec = f"REJECT DEPARTURE: {prob:.0f}% Spoilage Failure Risk"
+                        elif prob >= 10.0:
+                            rec = f"CAUTION: {prob:.0f}% Spoilage Risk"
+                        else:
+                            rec = f"APPROVE DEPARTURE: {prob:.1f}% Failure Risk"
+                        rows.append({
+                            "Departure Slot": label,
+                            "Failure Probability (%)": round(prob, 1),
+                            "95% VaR (R)": round(slot_result["value_at_risk_95_rand"]),
+                            "Expected Duration (min)": round(slot_result["expected_journey_time_mins"]),
+                            "Forecast Ambient (°C)": round(slot_result["forecast_ambient_temp_c"], 1),
+                            "Recommendation": rec,
+                        })
+            st.session_state.slot_matrix = rows
+
+    if st.session_state.slot_matrix:
+        rows = st.session_state.slot_matrix
+        if pd is not None:
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        else:
+            st.table(rows)
+        best = min(rows, key=lambda r: r["Failure Probability (%)"])
+        st.success(f"✅ Recommended departure slot: **{best['Departure Slot']}** — lowest failure probability at {best['Failure Probability (%)']:.1f}%.")
+
+
+# ===========================================================================
+# TAB 4 — Report (AI-generated business-value memo)
+# ===========================================================================
+with tab_ai_report:
+    st.title("📊 AI-Generated Business Value Report")
+    st.caption(
+        "Reads the live routing, cargo-risk, and weather metrics and asks a locally hosted "
+        "Qwen2.5-1.5B model to turn them into a comprehensive business-strategy memo. Runs "
+        "entirely on-box; the first report may take a minute or two while the model loads."
+    )
+
+    strategy_routing = backend_get("/v1/routing/truck-01", silent=True)
+    strategy_telematics = backend_get("/v1/telematics/truck-01", silent=True)
+
+    if not st.session_state.trip_configured:
+        st.info("Start a trip in the sidebar first — the report is built from that trip's live metrics.")
+    elif strategy_routing is None or strategy_routing.get("trip_plan") is None:
+        st.caption("Trip plan unavailable yet — start a simulator trip to generate a strategy report.")
+    else:
+        # Snapshot of the metrics feeding the report, so the dispatcher sees what
+        # the model is reasoning over.
+        trip_plan = strategy_routing["trip_plan"]
+        plan_bv = trip_plan["business_value"]
+        optimized_route = trip_plan["optimized_route"]
+
+        preview_cols = st.columns(4)
+        preview_cols[0].metric("Planned ETA (optimized)", f"{optimized_route['total_time_mins']:.0f} min")
+        preview_cols[1].metric("Rand Saved vs Standard", f"R {plan_bv['rand_saved']:,.0f}")
+        preview_cols[2].metric("Thermal Risk So Far", f"{(strategy_telematics or {}).get('thermal_risk_pct', 0.0):.1f}%")
+        amb = (strategy_telematics or {}).get("ambient_weather") or {}
+        preview_cols[3].metric("Ambient At Vehicle", f"{amb.get('temp_c', 0.0):.1f} °C")
+
+        # --- Deterministic Route Justification (always accurate, no LLM) -------
+        # Explains WHY the optimized route was chosen over the standard route and
+        # any other road on the map. Computed by the backend from the actual
+        # graph, so it's shown even if the local model is offline.
+        rationale = strategy_routing.get("route_rationale")
+        if rationale:
+            st.divider()
+            st.subheader("🧭 Route Justification — why this route, not the others")
+            rj_cols = st.columns(3)
+            rj_cols[0].metric("Rough km avoided", f"{rationale['rough_km_avoided']:.0f} km")
+            rj_cols[1].metric(
+                "Time cost vs standard",
+                f"{rationale['time_delta_mins']:+.0f} min" if rationale["routes_differ"] else "0 min",
+            )
+            rj_cols[2].metric("Spoilage risk cut", f"{rationale['spoilage_reduction_pts']:.1f} pts")
+            st.markdown(rationale["reason"])
+            opt_s = rationale["optimized_summary"]
+            std_s = rationale["standard_summary"]
+            st.caption(
+                f"**Chosen (optimized) route surface:** {opt_s['profile']} — "
+                f"{opt_s['rough_km']:.0f} km rough of {opt_s['total_km']:.0f} km total."
+            )
+            st.caption(
+                f"**Standard (time-only) route surface:** {std_s['profile']} — "
+                f"{std_s['rough_km']:.0f} km rough of {std_s['total_km']:.0f} km total."
+            )
+            if rationale.get("boundary_note"):
+                st.warning(rationale["boundary_note"])
+
+        st.divider()
+
+        if st.button("💡 Generate AI Business Strategy Report", use_container_width=True):
+            surface_classes = sorted({
+                (seg.get("fclass") or "unknown") for seg in optimized_route.get("segments", [])
+            })
+            surface_profile = ", ".join(surface_classes) if surface_classes else "unknown"
+
+            mechanical_risk_reduction_pct = (
+                plan_bv["standard_spoilage_risk_pct"] - plan_bv["optimized_spoilage_risk_pct"]
+            )
+            thermal_risk_pct = (strategy_telematics or {}).get("thermal_risk_pct", 0.0)
+            cargo_temp_status = (strategy_telematics or {}).get("cargo_temp_status", "Unknown")
+            strategy_ambient = (strategy_telematics or {}).get("ambient_weather") or {}
+
+            strategy_payload = {
+                "origin": trip_plan.get("origin_town") or "Current live position",
+                "destination": trip_plan.get("destination_town", ""),
+                "standard_time_mins": trip_plan["standard_route"]["total_time_mins"],
+                "optimized_time_mins": optimized_route["total_time_mins"],
+                "rand_saved": plan_bv["rand_saved"],
+                "mechanical_risk_reduction_pct": round(mechanical_risk_reduction_pct, 1),
+                "thermal_risk_pct": thermal_risk_pct,
+                "cargo_temp_status": cargo_temp_status,
+                "surface_profile": surface_profile,
+                "shipment_value_rand": plan_bv["shipment_value_rand"],
+                "ambient_temp_c": strategy_ambient.get("temp_c"),
+                "rain_mm": strategy_ambient.get("rain_mm"),
+                "weather_alert": strategy_ambient.get("alert"),
+                # Route-justification inputs so the memo gains a grounded
+                # "## Route Justification" section (see backend generate_ai_strategy).
+                "routes_differ": rationale.get("routes_differ") if rationale else None,
+                "rough_km_avoided": rationale.get("rough_km_avoided") if rationale else None,
+                "standard_route_profile": rationale["standard_summary"]["profile"] if rationale else None,
+                "optimized_route_profile": rationale["optimized_summary"]["profile"] if rationale else None,
+                "route_rationale_text": rationale.get("reason") if rationale else None,
+            }
+
+            logger.info("AI STRATEGY REQUEST -> dispatching trip-plan metrics to backend: %s", strategy_payload)
+
+            STRATEGY_TIMEOUT_SECONDS = 600
+            with st.spinner("🤖 Local model compiling econometric recommendations... (typically 3-6 minutes on CPU)"):
+                strategy_result = backend_post(
+                    "/v1/analytics/strategy", json_body=strategy_payload, timeout=STRATEGY_TIMEOUT_SECONDS
+                )
+
+            if strategy_result is not None:
+                if strategy_result.get("status") == "success":
+                    st.markdown(strategy_result["strategy_markdown"])
+                    logger.info(
+                        "AI STRATEGY REPORT -> received %d characters from model '%s'",
+                        len(strategy_result["strategy_markdown"]), strategy_result.get("model", "?"),
+                    )
+                else:
+                    st.error(strategy_result.get("message", "AI strategy generation failed."))
+                    logger.warning("AI STRATEGY REPORT -> backend returned error_type=%s", strategy_result.get("error_type"))
+
+
+# ===========================================================================
+# TAB 5 — Weather (live ambient climate + forecast along the route)
+# ===========================================================================
 with tab_weather:
     st.title("🌤️ Route Weather Analytics")
 
-    # --- One-time layout scaffold, same pattern as dispatch_metrics_view()
-    # above. This tab used to fetch its data with plain backend_get() calls
-    # made once per full script rerun (tab switch, sidebar click, browser
-    # refresh) and nothing else — there was no @st.fragment(run_every=...)
-    # driving it at all, so "Current Position" and its temperature only
-    # ever updated when something ELSE happened to trigger a full rerun,
-    # never on its own timer while the truck was actually driving. Every
-    # placeholder below is written to unconditionally on every single
-    # fragment run (never skipped by an if/else branch) — st.dataframe, like
-    # st.line_chart, needs its slot claimed on every run or a later
-    # fragment-only write into it raises the same "container not written to
-    # during the initial run" error fixed on the Dispatch tab's chart.
     wui: dict = {"source_info": st.empty()}
-
     wui["climate_header"] = st.empty()
     weather_cols = st.columns(3)
     wui["temp_metric"] = weather_cols[0].empty()
@@ -981,21 +1430,26 @@ with tab_weather:
         with wui["source_info"].container():
             if active_weather_source == "openweathermap":
                 st.caption(
-                    "Live ambient climate data at the vehicle's position and along the active "
-                    "route, via OpenWeatherMap — blends in nearby station observations, so this "
-                    "should track closely with sites like Google Weather."
+                    "🟢 Source: **OpenWeatherMap** (your API key was detected). Readings blend in "
+                    "nearby station observations, so they track closely with sites like Google "
+                    "Weather. The key is loaded from your local `.env` and is never shown here."
+                )
+            elif active_weather_source == "fallback":
+                st.caption(
+                    "🟠 Source: **baseline fallback** (25 °C / 0 mm) — the live weather providers "
+                    "could not be reached just now. Routing and telemetry keep working; readings "
+                    "refresh automatically when a provider responds again."
                 )
             else:
                 st.caption(
-                    "Live ambient climate data at the vehicle's position and along the active "
-                    "route, via the free Open-Meteo API — no API key required."
+                    "🔵 Source: **Open-Meteo** (keyless forecast-model estimate). No OpenWeatherMap "
+                    "key was detected."
                 )
                 st.caption(
-                    "ℹ️ Readings are a live forecast-model estimate for the exact coordinate, "
-                    "not a nearby weather station observation — expect roughly a 1-3°C margin "
-                    "versus sites like Google Weather that blend in local station data. Set an "
-                    "OPENWEATHERMAP_API_KEY environment variable (free tier at "
-                    "openweathermap.org) to switch to station-blended readings instead."
+                    "ℹ️ These are a live forecast-model estimate for the exact coordinate, not a "
+                    "nearby weather-station observation. To switch to station-blended OpenWeatherMap "
+                    "readings, drop `API_KEY = \"...\"` into a `.env` file next to weather_engine.py "
+                    "(free tier at openweathermap.org) and restart the backend."
                 )
 
         ambient = (weather_telematics or {}).get("ambient_weather") or {
@@ -1040,13 +1494,13 @@ with tab_weather:
         weather_profile = backend_get("/v1/routing/weather-profile", silent=True)
         if weather_profile is None or not weather_profile.get("segments"):
             wui["forecast_empty_state"].info(
-                "Start a trip in the Fleet Dispatch Hub to see a weather forecast along the route."
+                "Start a trip in the Customer Route Tracker to see a weather forecast along the route."
             )
-            # Every placeholder below must still be touched this run — an
-            # untouched st.dataframe slot here is exactly what caused the
-            # chart crash before: claim it now with an empty table, exactly
-            # as the "no history yet" branch does for the temperature chart.
-            wui["forecast_table"].dataframe([], use_container_width=True, hide_index=True)
+            # Claim the table slot with a lightweight caption instead of an empty
+            # st.dataframe. The empty dataframe rendered a boxy "empty" widget that
+            # the 2-second fragment refresh made flash in and out; a caption is
+            # stable and never shows that box.
+            wui["forecast_table"].caption("— no route forecast yet —")
             wui["forecast_alert"].empty()
             wui["hardware_note"].empty()
             wui["source_footer"].empty()
@@ -1058,17 +1512,6 @@ with tab_weather:
         any_rain_alert = False
         for seg in weather_profile["segments"]:
             if seg["label"] == "Current Position":
-                # Reuse the exact same ambient reading already shown in the
-                # "Active Vehicle Climate Context" metrics above, instead of
-                # weather-profile's own independent lookup for the same
-                # coordinate. This tab fetches /v1/telematics/truck-01 first
-                # and /v1/routing/weather-profile a moment later — each one
-                # snapshots the truck's live position separately, and for a
-                # fast-moving (simulator, 45x accelerated) truck that gap is
-                # enough to land in a different weather-cache grid cell,
-                # showing two slightly different numbers for what's supposed
-                # to read as the same "right now". Overriding with the
-                # already-fetched ambient dict guarantees they always match.
                 row_temp_c = ambient_temp_c
                 row_rain_mm = ambient.get("rain_mm", 0.0)
                 row_alert = ambient.get("alert", "Normal")

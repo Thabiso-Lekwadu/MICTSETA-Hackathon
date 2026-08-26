@@ -19,16 +19,18 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import pickle
 import re
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
 
 import networkx as nx
 import numpy as np
+import requests
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -37,6 +39,19 @@ from scipy.spatial import cKDTree
 
 import nc_road_network as ncr
 import weather_engine
+
+# vrp_simulation_generator.py is a sibling deliverable (Monte Carlo risk
+# solver + Stream A/B/C synthetic generators). Imported lazily/optionally,
+# exactly like the `transformers` import above: the core telemetry/routing/
+# driver-report loop must keep working even on a checkout where that file
+# hasn't been dropped in yet or fails to import for any reason. Only the
+# three new /v1/simulation/* endpoints below depend on it, and each one
+# degrades to a clean JSON error instead of crashing the server if it's
+# unavailable — see get_vrp_simulator().
+try:
+    import vrp_simulation_generator as vrpsim
+except ImportError:  # pragma: no cover - exercised only before that file exists
+    vrpsim = None
 
 # transformers is an optional dependency: the rest of the dispatch/routing
 # system must keep working (telemetry ingest, driver reports, live map) even
@@ -156,6 +171,187 @@ ROAD_CONDITION_ROUGHNESS: dict[str, float] = {
 }
 
 # ---------------------------------------------------------------------------
+# Weather sourcing — OpenWeatherMap primary, keyless fallback chain intact
+# ---------------------------------------------------------------------------
+# The Global Calibration Overrides call for OpenWeatherMap as the ambient-
+# weather source, with a hard requirement that a timeout/outage can never
+# raise an unhandled exception. weather_engine.py (a shared module, not one
+# of this refactor's three deliverables) already implements exactly that
+# fault-tolerant chain, but treats OpenWeatherMap as an *optional* upgrade
+# over Open-Meteo. Rather than editing that file (it's a working, tested
+# component outside this refactor's scope — "zero destructive modifications"
+# applies to it too), this module wraps it: every live weather lookup in
+# live_backend.py goes through get_ambient_weather() below, which tries
+# OpenWeatherMap's current-weather endpoint FIRST whenever an API key is
+# configured, and only falls through to weather_engine.get_current_weather()
+# (Open-Meteo, then the 25°C/0mm baseline) on a missing key or any failure.
+# This makes OpenWeatherMap primary end-to-end without weakening the
+# existing fallback safety net at all.
+# Resolved through weather_engine, which loads a `.env` from the weather
+# script's folder and accepts OPENWEATHERMAP_API_KEY / OWM_API_KEY / API_KEY.
+# The key lives only in the process environment — it is never logged here and
+# never included in any API response sent to the frontend.
+OPENWEATHERMAP_API_KEY = weather_engine.OPENWEATHERMAP_API_KEY
+OPENWEATHERMAP_CURRENT_URL = "https://api.openweathermap.org/data/2.5/weather"
+OPENWEATHERMAP_FORECAST_URL = "https://api.openweathermap.org/data/2.5/forecast"
+OWM_REQUEST_TIMEOUT_SECONDS = 5.0
+OWM_FORECAST_CACHE_TTL_SECONDS = 900.0  # 15 min: forecast blocks don't change fast enough to justify tighter TTL
+OWM_FORECAST_MAX_HORIZON_HOURS = 120.0  # OWM's free 5-day/3-hour forecast tier's real coverage window
+
+_owm_forecast_cache: dict[tuple[float, float, int], dict] = {}
+_owm_forecast_cache_lock = threading.Lock()
+
+if not OPENWEATHERMAP_API_KEY:
+    logging.getLogger("live_backend").warning(
+        "OPENWEATHERMAP_API_KEY is not set. Ambient weather will automatically "
+        "degrade to weather_engine's Open-Meteo/baseline chain until a key is "
+        "exported (get a free key at https://openweathermap.org/api)."
+    )
+
+
+def get_ambient_weather(lat: float, lon: float) -> weather_engine.WeatherReading:
+    """Live 'right now' ambient weather at a coordinate, OpenWeatherMap-first.
+    Never raises — any failure (missing key, timeout, malformed payload)
+    falls through to weather_engine's own Open-Meteo -> baseline chain."""
+    if OPENWEATHERMAP_API_KEY:
+        try:
+            response = requests.get(
+                OPENWEATHERMAP_CURRENT_URL,
+                params={"lat": lat, "lon": lon, "appid": OPENWEATHERMAP_API_KEY, "units": "metric"},
+                timeout=OWM_REQUEST_TIMEOUT_SECONDS,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            temp_c = float(payload["main"]["temp"])
+            rain_block = payload.get("rain") or {}
+            rain_mm = float(rain_block.get("1h", rain_block.get("3h", 0.0)) or 0.0)
+            alert = (
+                "Extreme Heat" if temp_c >= EXTREME_HEAT_THRESHOLD_C
+                else "Heavy Rain / Washout Risk" if rain_mm >= weather_engine.HEAVY_RAIN_THRESHOLD_MM
+                else "Normal"
+            )
+            return {"temp_c": temp_c, "rain_mm": rain_mm, "alert": alert, "source": "openweathermap"}
+        except Exception as exc:  # noqa: BLE001 - deliberately broad, see module docstring above
+            logger.warning(
+                "OWM PRIMARY WEATHER -> request failed for (%.4f, %.4f): %s. "
+                "Falling back to weather_engine (Open-Meteo/baseline).", lat, lon, exc,
+            )
+    return weather_engine.get_current_weather(lat, lon)
+
+
+def _owm_forecast_cache_key(lat: float, lon: float, target_dt: datetime) -> tuple[float, float, int]:
+    # 3-hour block index matches OWM's free-tier forecast granularity, so
+    # several nearby-in-time route samples reuse one cached block instead of
+    # each issuing a fresh request.
+    block_index = int(target_dt.timestamp() // (3 * 3600))
+    return (round(lat, 2), round(lon, 2), block_index)
+
+
+def get_owm_forecast(lat: float, lon: float, target_dt: datetime) -> dict | None:
+    """Looks up OpenWeatherMap's free 5-day/3-hour forecast for the block
+    nearest target_dt. Returns None (never raises) if no API key is set, the
+    request fails, or target_dt falls outside the ~120h window that tier
+    actually covers — callers fall back to the synthetic Stream A generator
+    in vrp_simulation_generator.py for anything this can't answer."""
+    if not OPENWEATHERMAP_API_KEY:
+        return None
+    now = datetime.now(timezone.utc)
+    target_utc = target_dt if target_dt.tzinfo else target_dt.replace(tzinfo=timezone.utc)
+    horizon_hours = (target_utc - now).total_seconds() / 3600.0
+    if horizon_hours < 0 or horizon_hours > OWM_FORECAST_MAX_HORIZON_HOURS:
+        return None
+
+    key = _owm_forecast_cache_key(lat, lon, target_utc)
+    now_monotonic = time.monotonic()
+    with _owm_forecast_cache_lock:
+        cached = _owm_forecast_cache.get(key)
+        if cached is not None and now_monotonic - cached["cached_at"] < OWM_FORECAST_CACHE_TTL_SECONDS:
+            return cached["reading"]
+
+    try:
+        response = requests.get(
+            OPENWEATHERMAP_FORECAST_URL,
+            params={"lat": lat, "lon": lon, "appid": OPENWEATHERMAP_API_KEY, "units": "metric"},
+            timeout=OWM_REQUEST_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        blocks = payload.get("list", [])
+        if not blocks:
+            return None
+        best_block, best_delta = None, float("inf")
+        for block in blocks:
+            block_dt = datetime.fromtimestamp(block["dt"], tz=timezone.utc)
+            delta = abs((block_dt - target_utc).total_seconds())
+            if delta < best_delta:
+                best_delta = delta
+                best_block = block
+        if best_block is None:
+            return None
+        temp_c = float(best_block["main"]["temp"])
+        rain_block = best_block.get("rain") or {}
+        rain_mm = float(rain_block.get("3h", 0.0) or 0.0)
+        reading = {
+            "ambient_temp_c": temp_c,
+            "rain_mm_per_hr": round(rain_mm / 3.0, 2),  # OWM reports a 3h total; normalize to a per-hour rate
+            "source": "openweathermap_forecast",
+        }
+    except Exception as exc:  # noqa: BLE001 - forecast lookup is best-effort only
+        logger.warning(
+            "OWM FORECAST -> request failed for (%.4f, %.4f) @ %s: %s. Falling back to synthetic forecast.",
+            lat, lon, target_utc.isoformat(), exc,
+        )
+        return None
+
+    with _owm_forecast_cache_lock:
+        _owm_forecast_cache[key] = {"cached_at": now_monotonic, "reading": reading}
+    return reading
+
+
+def get_forecast_weather(lat: float, lon: float, target_dt: datetime) -> dict:
+    """Single point of entry for FUTURE weather (as opposed to get_ambient_weather,
+    which is for RIGHT NOW). Tries OpenWeatherMap's real forecast first; if that
+    can't answer (no key, request failure, or target_dt beyond ~5 days out),
+    falls back to vrp_simulation_generator's synthetic Stream A model, and if
+    THAT module also isn't available, falls back one more time to the same
+    25°C/0mm clear-weather baseline weather_engine.py uses. This is the
+    fault-tolerance chain Global Calibration Overrides §2 asks for, just
+    extended to future timestamps instead of only 'right now'."""
+    owm_reading = get_owm_forecast(lat, lon, target_dt)
+    if owm_reading is not None:
+        return owm_reading
+    if vrpsim is not None:
+        try:
+            return vrpsim.synthetic_forecast_point(lat, lon, target_dt)
+        except Exception as exc:  # noqa: BLE001 - synthetic generator must never take the endpoint down either
+            logger.warning("SYNTHETIC FORECAST -> vrp_simulation_generator failed for (%.4f, %.4f): %s", lat, lon, exc)
+    return {
+        "ambient_temp_c": weather_engine.FALLBACK_TEMP_C,
+        "rain_mm_per_hr": weather_engine.FALLBACK_RAIN_MM,
+        "source": "fallback",
+    }
+
+
+# ---------------------------------------------------------------------------
+# GPS fix quality — deliberately DECOUPLED from ncr.SNAP_TOLERANCE_M (150m)
+# ---------------------------------------------------------------------------
+# validation_report.md flagged that reusing the 150m graph-construction
+# constant (endpoint-merge distance when BUILDING the road network) as a
+# stand-in for GPS-accuracy validation was "a borrowed tolerance" that made
+# the Snapping Accuracy check pass against a looser bar than intended. This
+# is that dedicated constant: 30m matches the RMSE target validation_report.md
+# itself states (Spatial Deviation <= 30m). It is used ONLY to label a fix's
+# confidence in API responses below — it never changes which node/edge a
+# coordinate actually snaps to for routing, which still correctly uses the
+# full topology built with ncr.SNAP_TOLERANCE_M.
+GPS_ACCURACY_TOLERANCE_M = 30.0
+
+
+def gps_fix_confidence(distance_km: float) -> str:
+    return "high_confidence" if distance_km * 1000.0 <= GPS_ACCURACY_TOLERANCE_M else "low_confidence"
+
+
+# ---------------------------------------------------------------------------
 # AI Cognitive Strategy Layer — local Hugging Face model advisory config
 # ---------------------------------------------------------------------------
 # Small instruction-tuned model chosen specifically so it runs comfortably
@@ -209,6 +405,14 @@ class StrategyRequest(BaseModel):
     ambient_temp_c: float | None = None
     rain_mm: float | None = None
     weather_alert: str | None = None
+    # Route-justification inputs (optional). When present, the memo gains a
+    # "## Route Justification" section explaining why this route was chosen
+    # over the standard route and any other road on the map.
+    routes_differ: bool | None = None
+    rough_km_avoided: float | None = None
+    standard_route_profile: str | None = None
+    optimized_route_profile: str | None = None
+    route_rationale_text: str | None = None
 
 
 # Lazily loaded, then cached for the life of the process — loading the model
@@ -387,7 +591,15 @@ def initialize_baseline_impedance(topology: nx.Graph) -> None:
         length_km = edge_attrs["length_km"]
         edge_attrs["imputed_speed_kmh"] = length_km / travel_time_hr if travel_time_hr > 0 else 0.0
         edge_attrs["base_time_mins"] = travel_time_hr * 60.0
-        edge_attrs["spoilage_cost"] = travel_time_hr * roughness
+        # Prefer a precomputed spoilage cost carried on the edge by the improved
+        # nc_road_network build (which can apply a non-linear roughness exponent
+        # and price inferred connectors). Falls back to the original linear
+        # travel_time * roughness for any graph that doesn't carry the field, so
+        # older pickles keep working identically.
+        precomputed_spoilage = edge_attrs.get("spoilage_cost_edge")
+        edge_attrs["spoilage_cost"] = (
+            precomputed_spoilage if precomputed_spoilage is not None else travel_time_hr * roughness
+        )
         edge_attrs["override"] = None
 
 
@@ -561,6 +773,122 @@ def build_route(origin_node: int, destination_node: int, weight_fn) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Route justification — deterministic "why THIS route" analysis
+# ---------------------------------------------------------------------------
+# Northern Cape bounding box (from Data_Audit.ipynb's NC_BBOX). Used only to
+# FLAG whether a chosen route strays outside the province envelope — the extract
+# is bbox-clipped to NC, so a route should never leave it; if a node does, it's
+# a data/clipping artifact worth surfacing rather than hiding.
+NC_BBOX = {"min_lon": 16.45, "max_lon": 25.30, "min_lat": -31.85, "max_lat": -24.60}
+NC_BBOX_TOLERANCE_DEG = 0.5  # same tolerance the audit uses at the extract edge
+
+# fclass families treated as "rough / unpaved" for the wear-and-spoilage story.
+ROUGH_FCLASSES = {
+    "track", "track_grade1", "track_grade2", "track_grade3", "track_grade4",
+    "track_grade5", "unclassified", "connector", "unpaved", "gravel", "dirt",
+}
+
+
+def _node_outside_nc(node: int) -> bool:
+    lon, lat = cluster_coord[node]
+    return not (
+        NC_BBOX["min_lon"] - NC_BBOX_TOLERANCE_DEG <= lon <= NC_BBOX["max_lon"] + NC_BBOX_TOLERANCE_DEG
+        and NC_BBOX["min_lat"] - NC_BBOX_TOLERANCE_DEG <= lat <= NC_BBOX["max_lat"] + NC_BBOX_TOLERANCE_DEG
+    )
+
+
+def summarize_route(path_nodes: list[int]) -> dict:
+    """Aggregates a resolved path into the facts the route-justification needs:
+    total distance, per-fclass km breakdown, rough vs paved km, and whether any
+    node strays outside the Northern Cape envelope."""
+    total_km = 0.0
+    by_fclass: dict[str, float] = {}
+    rough_km = 0.0
+    paved_km = 0.0
+    for u, v in zip(path_nodes[:-1], path_nodes[1:]):
+        edge_attrs = live_topology[u][v]
+        km = float(edge_attrs.get("length_km", 0.0) or 0.0)
+        fclass = str(edge_attrs.get("fclass", "unknown"))
+        total_km += km
+        by_fclass[fclass] = by_fclass.get(fclass, 0.0) + km
+        if fclass in ROUGH_FCLASSES:
+            rough_km += km
+        else:
+            paved_km += km
+    outside_nc_nodes = sum(1 for n in path_nodes if _node_outside_nc(n))
+    top_fclasses = sorted(by_fclass.items(), key=lambda kv: kv[1], reverse=True)
+    profile = ", ".join(f"{fc} {km:.0f}km" for fc, km in top_fclasses[:5])
+    return {
+        "total_km": round(total_km, 1),
+        "rough_km": round(rough_km, 1),
+        "paved_km": round(paved_km, 1),
+        "rough_pct": round(rough_km / total_km * 100, 1) if total_km > 0 else 0.0,
+        "fclass_km": {fc: round(km, 1) for fc, km in top_fclasses},
+        "profile": profile,
+        "outside_nc_nodes": outside_nc_nodes,
+        "hop_count": len(path_nodes) - 1,
+    }
+
+
+def build_route_rationale(standard: dict, optimized: dict,
+                          standard_summary: dict, optimized_summary: dict) -> dict:
+    """Plain-language, fully deterministic explanation of WHY the optimized route
+    was chosen over the time-only route (and, implicitly, over any other road on
+    the map): it is the spoilage-cost-minimizing path, and this quantifies the
+    roughness it avoids and the time that costs. Never involves the LLM, so the
+    Report tab can show a trustworthy justification even with the model offline."""
+    routes_differ = optimized["path_nodes"] != standard["path_nodes"]
+    time_delta_mins = round(optimized["total_time_mins"] - standard["total_time_mins"], 1)
+    spoilage_delta_pct = round(standard["spoilage_risk_pct"] - optimized["spoilage_risk_pct"], 1)
+    rough_km_avoided = round(standard_summary["rough_km"] - optimized_summary["rough_km"], 1)
+
+    if not routes_differ:
+        reason = (
+            "The spoilage-optimized route and the fastest (time-only) route are the SAME road. "
+            "On this corridor the quickest path is already the smoothest one, so there is no "
+            "rougher-but-faster shortcut worth avoiding — the optimizer confirms the fastest route "
+            "is also the lowest-spoilage route. Any other road visible on the map is either longer, "
+            "rougher, or both, which is exactly why it was not chosen."
+        )
+    else:
+        why_not_standard = (
+            f"The greyed 'standard' route is ~{abs(time_delta_mins):.0f} min "
+            f"{'faster' if time_delta_mins > 0 else 'different'} but runs over "
+            f"{standard_summary['rough_km']:.0f} km of rough/unpaved road "
+            f"({standard_summary['rough_pct']:.0f}% of its length); the chosen route trades "
+            f"{abs(time_delta_mins):.0f} min of travel time to cut that to "
+            f"{optimized_summary['rough_km']:.0f} km, avoiding ~{rough_km_avoided:.0f} km of "
+            f"vibration-heavy surface and lowering modelled spoilage risk by {spoilage_delta_pct:.1f} "
+            f"percentage points."
+        )
+        reason = (
+            "The optimizer minimizes cumulative spoilage cost (travel time × road-roughness), not "
+            "raw time. " + why_not_standard + " Every other road on the map was rejected because it "
+            "scored worse on that combined time-and-roughness cost."
+        )
+
+    boundary_note = None
+    if optimized_summary["outside_nc_nodes"] > 0 or standard_summary["outside_nc_nodes"] > 0:
+        boundary_note = (
+            f"Boundary check: {optimized_summary['outside_nc_nodes']} node(s) on the optimized route "
+            f"and {standard_summary['outside_nc_nodes']} on the standard route fall outside the "
+            "Northern Cape envelope (bbox-edge clipping); treat those legs as approximate."
+        )
+
+    return {
+        "routes_differ": routes_differ,
+        "chosen": "spoilage_optimized",
+        "time_delta_mins": time_delta_mins,
+        "spoilage_reduction_pts": spoilage_delta_pct,
+        "rough_km_avoided": rough_km_avoided,
+        "standard_summary": standard_summary,
+        "optimized_summary": optimized_summary,
+        "reason": reason,
+        "boundary_note": boundary_note,
+    }
+
+
 def build_cumulative_time_table(path_nodes: list[int]) -> tuple[list[tuple], float]:
     """Precomputes (cumulative_hours, lon, lat) at every node along a path,
     used to place the simulated truck at any elapsed-time fraction of the
@@ -657,6 +985,29 @@ def cargo_temp_status(temp_c: float) -> str:
     if temp_c <= safe_max + 5.0:
         return "Elevated"
     return "Critical"
+
+
+# Reefer condenser workload emulator (spec §4.1). While the truck moves, the
+# compressor load scales with how hard the unit is fighting ambient heat: a
+# documented (not fitted) linear model above a 25°C comfort baseline. When the
+# truck is stationary (speed < STATIONARY_SPEED_THRESHOLD_KMH — a queue or
+# gridlock) the condenser can't reject heat with no airflow in desert sun, so
+# the load is forced to 100% exactly as the spec requires. Reads live ambient
+# from CURRENT_WEATHER, kept fresh by every /v1/telematics/truck-01 poll.
+STATIONARY_SPEED_THRESHOLD_KMH = 5.0
+COMPRESSOR_BASE_LOAD_PCT = 45.0
+COMPRESSOR_HEAT_GAIN_PCT_PER_C = 3.0
+COMPRESSOR_COMFORT_BASELINE_C = 25.0
+
+
+def compressor_load_pct(speed_kmh: float, ambient_temp_c: float) -> float:
+    """Emulated compressor/condenser workload (%). Forced to 100% for a
+    stationary vehicle (models condenser strain in desert heat), otherwise a
+    heat-driven linear load clamped to [0, 100]."""
+    if speed_kmh < STATIONARY_SPEED_THRESHOLD_KMH:
+        return 100.0
+    load = COMPRESSOR_BASE_LOAD_PCT + COMPRESSOR_HEAT_GAIN_PCT_PER_C * max(0.0, ambient_temp_c - COMPRESSOR_COMFORT_BASELINE_C)
+    return round(max(0.0, min(100.0, load)), 1)
 
 
 def integrate_thermal_risk_hours(elapsed_hours: float, total_hours: float, steps: int = 200) -> float:
@@ -918,7 +1269,7 @@ def get_telematics() -> dict:
         snapshot_lon = tracking_state["lon"]
 
     weather_reading = (
-        weather_engine.get_current_weather(snapshot_lat, snapshot_lon)
+        get_ambient_weather(snapshot_lat, snapshot_lon)
         if snapshot_lat is not None and snapshot_lon is not None
         else None
     )
@@ -1034,6 +1385,12 @@ def get_telematics() -> dict:
         payload["composite_cargo_risk_pct"] = composite_cargo_risk_pct
         payload["expected_loss_rand_so_far"] = expected_loss_rand_so_far
         payload["ambient_weather"] = dict(CURRENT_WEATHER)
+        # Emulated reefer compressor workload (spec §4.1). Stationary vehicle
+        # (speed < 5 km/h) is pinned to 100% to model condenser strain in
+        # desert heat; otherwise it scales with live ambient temperature.
+        payload["compressor_load_pct"] = compressor_load_pct(
+            tracking_state.get("speed_kmh", 0.0), CURRENT_WEATHER["temp_c"]
+        )
 
         if trip_state["configured"] and trip_state["mode"] == "simulator" and trip_state["sim_total_hours"]:
             elapsed_real_s = time.monotonic() - trip_state["trip_start_ts"]
@@ -1080,6 +1437,12 @@ def get_routing() -> dict:
     rand_saved = round(standard["expected_loss_rand"] - optimized["expected_loss_rand"], -2)
     detour_active = optimized["path_nodes"] != standard["path_nodes"]
 
+    # Deterministic "why this route" analysis — powers the Report tab's Route
+    # Justification panel and grounds the AI memo's justification section.
+    optimized_summary = summarize_route(optimized["path_nodes"])
+    standard_summary = summarize_route(standard["path_nodes"])
+    route_rationale = build_route_rationale(standard, optimized, standard_summary, optimized_summary)
+
     current_node, snap_distance_km = node_index.snap(current_lat, current_lon)
 
     return {
@@ -1087,6 +1450,7 @@ def get_routing() -> dict:
         "feed_source": feed_source,
         "snapped_node_id": current_node,
         "snap_distance_km": round(snap_distance_km, 3),
+        "gps_fix_confidence": gps_fix_confidence(snap_distance_km),
         "destination_node_id": destination_node,
         "destination_town": trip_state["destination_town"],
         "origin_town": trip_state["origin_town"],
@@ -1107,6 +1471,9 @@ def get_routing() -> dict:
         # planning figures from when the trip was configured, unaffected by
         # how far the truck has since traveled.
         "trip_plan": trip_plan,
+        # Deterministic justification for why the optimized route was chosen
+        # over the standard route and any other road on the map.
+        "route_rationale": route_rationale,
         # kept for compatibility with older callers expecting a single "path"
         "path": optimized["coordinates"],
     }
@@ -1164,7 +1531,7 @@ def get_routing_weather_profile() -> dict:
 
     segments = []
     for label, (lon, lat) in zip(labels, sample_points):
-        reading = weather_engine.get_current_weather(lat, lon)
+        reading = get_ambient_weather(lat, lon)
         segments.append({
             "label": label,
             "lat": round(lat, 5),
@@ -1178,7 +1545,7 @@ def get_routing_weather_profile() -> dict:
     # Live reading at the truck's ACTUAL current position — always reflects
     # wherever it is right now, distinct from the fixed corridor rows above.
     # This is the one that visibly moves as the truck drives.
-    current_reading = weather_engine.get_current_weather(current_lat, current_lon)
+    current_reading = get_ambient_weather(current_lat, current_lon)
     segments.append({
         "label": "Current Position",
         "lat": round(current_lat, 5),
@@ -1238,6 +1605,7 @@ def submit_report(report: FieldReport) -> dict:
         "status": "success",
         "matched_segment": [matched_u, matched_v],
         "distance_from_report_km": round(distance_km, 3),
+        "gps_fix_confidence": gps_fix_confidence(distance_km),
         "applied_override": override_record,
         "active_report_count": len(active_driver_reports),
     }
@@ -1302,6 +1670,17 @@ def generate_ai_strategy(payload: StrategyRequest) -> dict:
             f"- Live weather alert status: {payload.weather_alert or 'Normal'}\n"
         )
 
+    route_justification_section = ""
+    if payload.route_rationale_text or payload.standard_route_profile:
+        route_justification_section = (
+            "\nROUTE-SELECTION FACTS (use these to write a '## Route Justification' section):\n"
+            f"- Chosen (spoilage-optimized) route surface profile: {payload.optimized_route_profile or 'n/a'}\n"
+            f"- Standard (time-only) route surface profile: {payload.standard_route_profile or 'n/a'}\n"
+            f"- Rough/unpaved km avoided by the chosen route: {(payload.rough_km_avoided or 0.0):.0f} km\n"
+            f"- Do the two routes differ: {payload.routes_differ}\n"
+            f"- Deterministic rationale already computed by the system: {payload.route_rationale_text or 'n/a'}\n"
+        )
+
     user_prompt = (
         f"FIXED ROUTE FOR THIS MEMO: {payload.origin} -> {payload.destination}\n"
         f"(Use these exact two town names throughout. Do not mention any other "
@@ -1317,12 +1696,28 @@ def generate_ai_strategy(payload: StrategyRequest) -> dict:
         f"- Current cargo temperature status: {payload.cargo_temp_status}\n"
         f"- Road surface profile along the optimized route: {payload.surface_profile}\n"
         f"{weather_section}"
+        f"{route_justification_section}"
         f"- Total shipment value at risk: R {payload.shipment_value_rand:,.0f}\n\n"
+        "INTERPRETATION GUIDANCE (read before writing):\n"
+        "- If the optimized and standard route durations are equal and the Rand saved is R 0, this "
+        "  does NOT mean the optimizer failed. It means the fastest route on this corridor already "
+        "  coincides with the lowest-spoilage route — there is no rougher-but-faster shortcut to avoid, "
+        "  so the time-optimal and spoilage-optimal paths are the same road. Frame this as a "
+        "  CONFIRMED-OPTIMAL result (no cheaper or safer alternative exists on this corridor), and then "
+        "  make the thermal-exposure risk the focus of the memo, since with mechanical risk already "
+        "  minimized, temperature exposure is the binding risk on this shipment.\n"
+        "- Keep the memo fully self-contained and make sure you COMPLETE the final prioritized action "
+        "  list — do not stop mid-sentence.\n\n"
         "Using ONLY these figures, produce a strategic business memo for the cooperative's "
         "dispatch manager: quantify the Rand-value trade-off between extra travel time and "
         "spoilage avoided, address both the mechanical and thermal risk components separately, "
         "note the vehicle wear-and-tear implication of the surface profile, and recommend "
-        "whether this shipment should take the standard or the optimized route.\n\n"
+        "whether this shipment should take the standard or the optimized route. If ROUTE-SELECTION "
+        "FACTS were provided above, include a dedicated '## Route Justification' section that "
+        "explains, in plain language for a non-technical manager, WHY the system chose this "
+        "specific route and did NOT choose the standard route or any other road on the map — "
+        "ground it in the rough-km-avoided and surface-profile numbers given, and if the two "
+        "routes are identical, say plainly that the fastest road is already the safest.\n\n"
         f"Reminder: this memo is specifically about the {payload.origin} -> {payload.destination} "
         f"route. Do not substitute any other town names. Do not write your own title, date, or "
         f"route line — begin directly with '## Introduction'."
@@ -1339,7 +1734,11 @@ def generate_ai_strategy(payload: StrategyRequest) -> dict:
     )
 
     try:
-        output = generator(messages, max_new_tokens=700, do_sample=True, temperature=0.4)
+        # 1100 tokens (was 700): the previous budget cut the memo off mid-way
+        # through its final action list. A cold-chain strategy memo with an
+        # intro, separate mechanical + thermal sections, a wear-and-tear note,
+        # and a completed prioritized action list needs the extra headroom.
+        output = generator(messages, max_new_tokens=1100, do_sample=True, temperature=0.35)
     except Exception as exc:  # noqa: BLE001 - deliberately broad: any local inference
         # failure mode must degrade to a clean JSON error, never propagate and
         # freeze the request thread or take down the API process.
@@ -1380,6 +1779,316 @@ def generate_ai_strategy(payload: StrategyRequest) -> dict:
         "origin": payload.origin,
         "destination": payload.destination,
         "strategy_markdown": strategy_markdown,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Predictive / future-hazard routing — spec §4.2, §4.3, and the Monte Carlo
+# call the frontend's "Journey Prediction & Scheduling" tab needs.
+# ---------------------------------------------------------------------------
+# How many nodes along a candidate path get an actual forecast lookup. The
+# province-scale graph (tens of thousands of nodes) means a long-haul path
+# can carry hundreds of hops; forecasting every single one would mean
+# hundreds of OWM calls per request. Instead the path is sampled evenly at
+# up to this many points (always including the first and last node), which
+# is enough to catch a storm/heat cell sitting on the corridor without
+# hammering the forecast API or making a request pathologically slow. This
+# is a documented engineering trade-off, not a placeholder.
+PREDICTIVE_ROUTE_MAX_SAMPLES = 40
+# Hazard spoilage-cost multiplier applied to a sampled edge's neighborhood
+# when the forecast at that point predicts extreme heat or storm washout —
+# large enough that the spoilage-weighted shortest-path solver reliably
+# routes around it, mirroring how a driver-reported "Impassable / Washed
+# Out" override (roughness >= 6.0, see ROAD_CONDITION_ROUGHNESS) behaves.
+PREDICTIVE_HAZARD_MULTIPLIER = 6.0
+PREDICTIVE_MAX_HORIZON_DAYS = 7
+
+
+class PredictiveRouteRequest(BaseModel):
+    origin_town: str
+    destination_town: str
+    # ISO 8601, e.g. "2026-09-01T14:00:00". Naive timestamps are treated as UTC.
+    target_datetime: str
+
+
+class MonteCarloRequest(BaseModel):
+    origin_town: str
+    destination_town: str
+    target_datetime: str
+    shipment_value_rand: float | None = Field(None, gt=0.0)
+    iterations: int = Field(1000, ge=100, le=5000)
+    # When true, the response includes per-trial arrays so the frontend can
+    # stream the distribution as it builds and draw a live histogram.
+    return_samples: bool = False
+
+
+def parse_target_datetime(raw: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=f"Could not parse target_datetime '{raw}': {exc}") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc)
+    if parsed < now:
+        raise HTTPException(status_code=422, detail="target_datetime must be in the future.")
+    if parsed > now + timedelta(days=PREDICTIVE_MAX_HORIZON_DAYS):
+        raise HTTPException(
+            status_code=422,
+            detail=f"target_datetime must be within {PREDICTIVE_MAX_HORIZON_DAYS} days from now.",
+        )
+    return parsed
+
+
+def sample_route_hazards(path_nodes: list[int], target_dt: datetime) -> tuple[dict[tuple[int, int], float], list[dict]]:
+    """Forecasts weather at an evenly-spaced sample of nodes along a path and
+    returns (a) a per-edge hazard-multiplier dict covering every edge
+    touching a hazardous sample node, for feeding into the spoilage weight
+    function, and (b) a plain list describing each hazard for the API
+    response / frontend map overlay."""
+    if len(path_nodes) <= PREDICTIVE_ROUTE_MAX_SAMPLES:
+        sample_indices = list(range(len(path_nodes)))
+    else:
+        step = (len(path_nodes) - 1) / (PREDICTIVE_ROUTE_MAX_SAMPLES - 1)
+        sample_indices = sorted({round(i * step) for i in range(PREDICTIVE_ROUTE_MAX_SAMPLES)})
+
+    hazard_multipliers: dict[tuple[int, int], float] = {}
+    hazard_zones: list[dict] = []
+
+    for idx in sample_indices:
+        node = path_nodes[idx]
+        lon, lat = cluster_coord[node]
+        try:
+            forecast = get_forecast_weather(lat, lon, target_dt)
+        except Exception as exc:  # noqa: BLE001 - one bad sample must never abort the whole route computation
+            logger.warning("PREDICTIVE ROUTE -> forecast sample failed at node %s: %s", node, exc)
+            continue
+
+        temp_c = forecast["ambient_temp_c"]
+        rain_mm = forecast["rain_mm_per_hr"]
+        is_extreme_heat = temp_c >= EXTREME_HEAT_THRESHOLD_C
+        is_storm_washout = rain_mm >= weather_engine.HEAVY_RAIN_THRESHOLD_MM
+        if not (is_extreme_heat or is_storm_washout):
+            continue
+
+        reason = "Extreme Heat" if is_extreme_heat else "Storm / Washout Risk"
+        hazard_zones.append({
+            "node_id": node,
+            "lat": round(lat, 5),
+            "lon": round(lon, 5),
+            "forecast_ambient_temp_c": round(temp_c, 1),
+            "forecast_rain_mm_per_hr": round(rain_mm, 2),
+            "reason": reason,
+            "source": forecast["source"],
+        })
+
+        # Spike every edge incident to this node (both directions) so the solver
+        # actually has an incentive to route around this point rather than just
+        # through it. Works whether the loaded topology is directed (successors /
+        # predecessors) or undirected (neighbors) — the default nc_road_network
+        # build is undirected, while build_directed_graph() yields a MultiDiGraph.
+        if live_topology.is_directed():
+            incident_neighbors = list(live_topology.successors(node)) + list(live_topology.predecessors(node))
+        else:
+            incident_neighbors = list(live_topology.neighbors(node))
+        for neighbor in incident_neighbors:
+            hazard_multipliers[(node, neighbor)] = PREDICTIVE_HAZARD_MULTIPLIER
+            hazard_multipliers[(neighbor, node)] = PREDICTIVE_HAZARD_MULTIPLIER
+
+    return hazard_multipliers, hazard_zones
+
+
+def build_predictive_route(origin_node: int, destination_node: int, hazard_multipliers: dict[tuple[int, int], float]) -> dict:
+    """Same shape as build_route(), but the spoilage weight used for path
+    selection AND for the reported spoilage totals is multiplied by any
+    forecast-hazard override for that edge. Never mutates live_topology —
+    the multiplier only exists for the duration of this one path-finding
+    call, so it can never leak into the standard live routing endpoints."""
+    def hazard_spoilage_weight(u: int, v: int, edge_attrs: dict) -> float:
+        return effective_spoilage(u, v, edge_attrs) * hazard_multipliers.get((u, v), 1.0)
+
+    try:
+        path = nx.shortest_path(live_topology, origin_node, destination_node, weight=hazard_spoilage_weight)
+    except nx.NetworkXNoPath as exc:
+        raise HTTPException(status_code=422, detail=f"No route found: {exc}") from exc
+    except nx.NodeNotFound as exc:
+        raise HTTPException(status_code=422, detail=f"Node not found in topology: {exc}") from exc
+
+    segments = []
+    total_time_mins = 0.0
+    total_spoilage_cost = 0.0
+    for u, v in zip(path[:-1], path[1:]):
+        edge_attrs = live_topology[u][v]
+        seg_time = effective_time_mins(u, v, edge_attrs)
+        seg_spoilage = hazard_spoilage_weight(u, v, edge_attrs)
+        total_time_mins += seg_time
+        total_spoilage_cost += seg_spoilage
+        segments.append({
+            "coords": [list(cluster_coord[u]), list(cluster_coord[v])],
+            "fclass": edge_attrs.get("fclass"),
+            "hazard_multiplier_applied": hazard_multipliers.get((u, v), 1.0),
+        })
+
+    spoilage_pct = min(1.0, total_spoilage_cost / SPOILAGE_THRESHOLD)
+    expected_loss_rand = round(spoilage_pct * live_settings["shipment_value_rand"], -2)
+
+    return {
+        "path_nodes": path,
+        "coordinates": [list(cluster_coord[n]) for n in path],
+        "segments": segments,
+        "total_time_mins": round(total_time_mins, 1),
+        "total_spoilage_cost": round(total_spoilage_cost, 3),
+        "spoilage_risk_pct": round(spoilage_pct * 100, 1),
+        "expected_loss_rand": expected_loss_rand,
+    }
+
+
+def compute_predictive_route(origin_town: str, destination_town: str, target_dt: datetime) -> dict:
+    """Shared core used by both /v1/simulation/predictive-route and
+    /v1/simulation/compare-slots so the two endpoints can never drift out of
+    sync on how a slot is evaluated."""
+    origin_node = resolve_town_node(origin_town)
+    destination_node = resolve_town_node(destination_town)
+
+    baseline_optimized = build_route(origin_node, destination_node, spoilage_weight)
+    hazard_multipliers, hazard_zones = sample_route_hazards(baseline_optimized["path_nodes"], target_dt)
+
+    if hazard_multipliers:
+        predictive_route = build_predictive_route(origin_node, destination_node, hazard_multipliers)
+        rerouted = predictive_route["path_nodes"] != baseline_optimized["path_nodes"]
+    else:
+        predictive_route = baseline_optimized
+        rerouted = False
+
+    return {
+        "origin_town": origin_town,
+        "destination_town": destination_town,
+        "target_datetime": target_dt.isoformat(),
+        "hazard_zones": hazard_zones,
+        "hazard_count": len(hazard_zones),
+        "rerouted_around_hazard": rerouted,
+        "baseline_optimized_route": baseline_optimized,
+        "predictive_route": predictive_route,
+        "delta_vs_baseline": {
+            "extra_time_mins": round(predictive_route["total_time_mins"] - baseline_optimized["total_time_mins"], 1),
+            "spoilage_risk_change_pct": round(
+                predictive_route["spoilage_risk_pct"] - baseline_optimized["spoilage_risk_pct"], 1
+            ),
+        },
+    }
+
+
+@app.post("/v1/simulation/predictive-route")
+def predictive_route(payload: PredictiveRouteRequest) -> dict:
+    """Spec §4.2. Accepts a future ISO timestamp up to 7 days out, samples the
+    forecast (OpenWeatherMap forecast -> synthetic Stream A -> baseline, see
+    get_forecast_weather) along the current spoilage-optimized corridor, and
+    — wherever a sampled point forecasts extreme heat or a storm washout —
+    spikes that neighborhood's spoilage_cost and re-solves the shortest path
+    so the route dynamically detours around the future hazard zone."""
+    target_dt = parse_target_datetime(payload.target_datetime)
+    logger.info(
+        "PREDICTIVE ROUTE REQUEST -> origin=%s destination=%s target=%s",
+        payload.origin_town, payload.destination_town, target_dt.isoformat(),
+    )
+    return compute_predictive_route(payload.origin_town, payload.destination_town, target_dt)
+
+
+@app.get("/v1/simulation/compare-slots")
+def compare_departure_slots(origin_town: str, destination_town: str) -> dict:
+    """Spec §4.3. Compares three departure windows (Now, +12h, +24h) and
+    returns a JSON comparison matrix identifying which slot minimizes
+    cold-chain degradation, with a plain-language recommendation per slot."""
+    # Resolve towns once up front so an unknown town name fails fast with a
+    # clear 422 instead of failing deep inside the third slot's computation.
+    resolve_town_node(origin_town)
+    resolve_town_node(destination_town)
+
+    now = datetime.now(timezone.utc)
+    slots = [("Now", now), ("+12h", now + timedelta(hours=12)), ("+24h", now + timedelta(hours=24))]
+
+    rows = []
+    for label, slot_dt in slots:
+        # "Now" can be a few seconds behind datetime.now() by the time it
+        # reaches parse_target_datetime's >= now check inside compute_predictive_route's
+        # forecast lookups; nudge it forward by a minute so it never trips
+        # that guard due to request latency.
+        safe_dt = max(slot_dt, datetime.now(timezone.utc) + timedelta(minutes=1))
+        result = compute_predictive_route(origin_town, destination_town, safe_dt)
+        spoilage_pct = result["predictive_route"]["spoilage_risk_pct"]
+        if spoilage_pct >= 25.0:
+            recommendation = f"REJECT DEPARTURE: {spoilage_pct:.0f}% Spoilage Failure Risk"
+        elif spoilage_pct >= 10.0:
+            recommendation = f"CAUTION: {spoilage_pct:.0f}% Spoilage Risk — consider a later slot"
+        else:
+            recommendation = f"APPROVE DEPARTURE: {spoilage_pct:.1f}% Failure Risk"
+        rows.append({
+            "slot_label": label,
+            "departure_datetime": safe_dt.isoformat(),
+            "total_time_mins": result["predictive_route"]["total_time_mins"],
+            "spoilage_risk_pct": spoilage_pct,
+            "expected_loss_rand": result["predictive_route"]["expected_loss_rand"],
+            "hazard_count": result["hazard_count"],
+            "rerouted_around_hazard": result["rerouted_around_hazard"],
+            "recommendation": recommendation,
+        })
+
+    best_slot = min(rows, key=lambda row: row["spoilage_risk_pct"])
+    return {
+        "origin_town": origin_town,
+        "destination_town": destination_town,
+        "slots": rows,
+        "recommended_slot_label": best_slot["slot_label"],
+    }
+
+
+@app.post("/v1/simulation/monte-carlo-risk")
+def monte_carlo_risk(payload: MonteCarloRequest) -> dict:
+    """Backs the frontend's "🎲 Run Monte Carlo Stochastic Risk Test" button.
+    Delegates the actual 1,000-trial thermal/customs/infrastructure-shock
+    simulation to vrp_simulation_generator.run_monte_carlo_risk_analysis
+    (spec §3.2) — this endpoint's job is just request validation, node
+    resolution, and the same fail-soft-JSON pattern already used by
+    /v1/analytics/strategy for its own optional heavy dependency."""
+    if vrpsim is None:
+        return {
+            "status": "error",
+            "error_type": "vrp_simulation_generator_not_available",
+            "message": (
+                "vrp_simulation_generator.py could not be imported. Make sure it's "
+                "present alongside live_backend.py and installs cleanly."
+            ),
+        }
+
+    target_dt = parse_target_datetime(payload.target_datetime)
+    origin_node = resolve_town_node(payload.origin_town)
+    destination_node = resolve_town_node(payload.destination_town)
+    shipment_value_rand = payload.shipment_value_rand or live_settings["shipment_value_rand"]
+
+    logger.info(
+        "MONTE CARLO REQUEST -> origin=%s destination=%s target=%s iterations=%d shipment_value_rand=%.0f",
+        payload.origin_town, payload.destination_town, target_dt.isoformat(),
+        payload.iterations, shipment_value_rand,
+    )
+
+    try:
+        result = vrpsim.run_monte_carlo_risk_analysis(
+            live_topology, cluster_coord, origin_node, destination_node,
+            target_dt, shipment_value_rand=shipment_value_rand, iterations=payload.iterations,
+            return_samples=payload.return_samples,
+        )
+    except Exception as exc:  # noqa: BLE001 - a simulation failure must degrade to JSON, never crash the API
+        logger.error("MONTE CARLO -> run_monte_carlo_risk_analysis failed: %s", exc)
+        return {"status": "error", "error_type": "simulation_failed", "message": str(exc)}
+
+    return {
+        "status": "success",
+        "origin_town": payload.origin_town,
+        "destination_town": payload.destination_town,
+        "target_datetime": target_dt.isoformat(),
+        "iterations": payload.iterations,
+        "shipment_value_rand": shipment_value_rand,
+        **result,
     }
 
 

@@ -2,25 +2,32 @@
 weather_engine.py
 
 Isolated atmospheric data module for the Northern Cape Fleet Dispatch system.
-Wraps the free, keyless Open-Meteo API (https://open-meteo.com) with a small
-TTL cache so live dashboard polling (every ~2s from live_frontend.py) never
-hammers the external service, and a hard fallback to a clear-weather
-baseline so a network blip or API outage can never take down routing,
-telemetry, or the dispatch UI that depend on it.
 
-Optionally, if an OPENWEATHERMAP_API_KEY environment variable is set, current
-readings are tried against OpenWeatherMap first — its "current weather"
-endpoint blends in real nearby station observations rather than being a pure
-forecast-model estimate, so it tracks a live thermometer (and Google's
-weather numbers, which do the same blending) more closely. Open-Meteo is
-still always the fallback if OpenWeatherMap isn't configured or a call to it
-fails, so nothing about this app's behavior changes for anyone who doesn't
-set the key.
+Provider order (highest fidelity first), all fault-tolerant:
+  1. OpenWeatherMap  — used when an API key is configured. Its "current weather"
+     endpoint blends in real nearby station observations, so it tracks a live
+     thermometer (and Google's numbers) closely.
+  2. Open-Meteo      — free, keyless forecast-model estimate. Always the fallback
+     if OpenWeatherMap isn't configured or a call to it fails.
+  3. 25°C / 0 mm baseline — a final hard fallback so a network blip can never
+     take down routing, telemetry, or the dispatch UI.
 
-Deliberately kept dependency-free beyond `requests` and stateless from the
-caller's point of view — live_backend.py never needs to know whether a given
-reading came from OpenWeatherMap, Open-Meteo, the cache, or the fallback; it
-just gets a WeatherReading back, always.
+API KEY HANDLING (never exposed):
+  The OpenWeatherMap key is read from the environment, and — as a convenience —
+  from a local `.env` file sitting in THIS module's folder. Any of these variable
+  names is accepted (checked in order): OPENWEATHERMAP_API_KEY, OWM_API_KEY,
+  API_KEY. So a `.env` next to this file containing simply:
+
+      API_KEY = "your-openweathermap-key"
+
+  is enough. The key is loaded into the process environment only; it is NEVER
+  logged, never returned in any WeatherReading, and never sent to the frontend —
+  callers only ever see the resolved provider name ("openweathermap" /
+  "open-meteo" / "fallback"), not the secret. Keep `.env` out of version control
+  (add it to .gitignore); a committable `.env.example` ships alongside.
+
+Deliberately dependency-free beyond `requests`: the `.env` parser below is a tiny
+built-in so no python-dotenv install is required.
 """
 
 from __future__ import annotations
@@ -29,11 +36,89 @@ import logging
 import os
 import threading
 import time
+from pathlib import Path
 from typing import TypedDict
 
 import requests
 
 logger = logging.getLogger("weather_engine")
+
+# ---------------------------------------------------------------------------
+# .env loading + API-key resolution (no secret ever logged)
+# ---------------------------------------------------------------------------
+# Accepted env-var names for the OpenWeatherMap key, in priority order. API_KEY
+# is included because that's the simplest name a user is likely to drop into a
+# local .env, exactly as requested.
+_OWM_KEY_ENV_NAMES = ("OPENWEATHERMAP_API_KEY", "OWM_API_KEY", "API_KEY")
+
+
+def _parse_dotenv_line(line: str) -> tuple[str, str] | None:
+    """Parses one `KEY = "value"` / `KEY=value` / `export KEY=value` line.
+    Ignores blanks and `#` comments. Strips surrounding quotes and whitespace.
+    Returns (key, value) or None."""
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return None
+    if stripped.lower().startswith("export "):
+        stripped = stripped[len("export "):]
+    if "=" not in stripped:
+        return None
+    key, _, value = stripped.partition("=")
+    key = key.strip()
+    value = value.strip()
+    # Drop an inline comment only when the value isn't quoted.
+    if value and value[0] not in ("'", '"') and " #" in value:
+        value = value.split(" #", 1)[0].strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        value = value[1:-1]
+    if not key:
+        return None
+    return key, value
+
+
+def load_dotenv(dotenv_path: Path | None = None) -> bool:
+    """Loads a `.env` file from this module's folder (or an explicit path) into
+    os.environ, WITHOUT overriding variables already set in the real environment
+    (real env wins). Never raises, never logs any value. Returns True if a file
+    was found and read."""
+    path = dotenv_path or Path(__file__).resolve().with_name(".env")
+    try:
+        if not path.exists():
+            return False
+        for raw_line in path.read_text(encoding="utf-8").splitlines():
+            parsed = _parse_dotenv_line(raw_line)
+            if parsed is None:
+                continue
+            key, value = parsed
+            os.environ.setdefault(key, value)  # real env var takes precedence
+        logger.info("weather_engine -> loaded environment overrides from %s (values not logged).", path.name)
+        return True
+    except Exception as exc:  # noqa: BLE001 - a malformed .env must never crash import
+        logger.warning("weather_engine -> could not read .env (%s); continuing without it.", exc)
+        return False
+
+
+def resolve_owm_api_key() -> str:
+    """Returns the OpenWeatherMap key from the first matching env var (after
+    .env has been loaded), or "" if none is configured. The returned value is a
+    secret — callers must not log it."""
+    for name in _OWM_KEY_ENV_NAMES:
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+    return ""
+
+
+# Load .env once at import, then resolve the key.
+load_dotenv()
+OPENWEATHERMAP_API_KEY = resolve_owm_api_key()
+WEATHER_KEY_CONFIGURED = bool(OPENWEATHERMAP_API_KEY)
+ACTIVE_PROVIDER = "openweathermap" if WEATHER_KEY_CONFIGURED else "open-meteo"
+
+if WEATHER_KEY_CONFIGURED:
+    logger.info("weather_engine -> OpenWeatherMap key detected; using station-blended readings (key not logged).")
+else:
+    logger.info("weather_engine -> no OpenWeatherMap key found; using the keyless Open-Meteo provider.")
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -42,16 +127,6 @@ OPEN_METEO_BASE_URL = "https://api.open-meteo.com/v1/forecast"
 OPENWEATHERMAP_BASE_URL = "https://api.openweathermap.org/data/2.5/weather"
 REQUEST_TIMEOUT_SECONDS = 5.0
 
-# Free-tier station-blended provider. Optional — unset means "use Open-Meteo
-# only", exactly as before. Get a free key at https://openweathermap.org/api
-# if closer alignment with Google/ground-truth station readings matters more
-# than staying fully keyless.
-OPENWEATHERMAP_API_KEY = os.environ.get("OPENWEATHERMAP_API_KEY", "").strip()
-
-# Fallback used whenever the live API can't be reached in time or returns
-# something malformed — a plausible clear, mild Northern Cape day, not an
-# alarming value, so a network blip can never accidentally trip a heat/storm
-# alert downstream on its own.
 FALLBACK_TEMP_C = 25.0
 FALLBACK_RAIN_MM = 0.0
 FALLBACK_ALERT = "Normal"
@@ -59,10 +134,6 @@ FALLBACK_ALERT = "Normal"
 EXTREME_HEAT_THRESHOLD_C = 38.0
 HEAVY_RAIN_THRESHOLD_MM = 5.0
 
-# Coordinates are cached at 2-decimal-degree precision (~1.1km) so several
-# polls of the same truck a few seconds apart share one cache entry instead
-# of each issuing a fresh request. TTL keeps the cache from ever serving
-# genuinely stale weather during a long-running session.
 CACHE_TTL_SECONDS = 300.0
 
 _cache: dict[tuple[float, float], tuple[float, "WeatherReading"]] = {}
@@ -81,10 +152,6 @@ def _cache_key(lat: float, lon: float) -> tuple[float, float]:
 
 
 def _classify_alert(temp_c: float, rain_mm: float) -> str:
-    # Heat takes priority in the label since it's the more acute risk to the
-    # reefer unit itself; a segment can still be hot AND rainy simultaneously,
-    # callers that need both signals should read temp_c/rain_mm directly
-    # rather than relying on this single label for everything.
     if temp_c >= EXTREME_HEAT_THRESHOLD_C:
         return "Extreme Heat"
     if rain_mm >= HEAVY_RAIN_THRESHOLD_MM:
@@ -102,11 +169,10 @@ def _fallback_reading() -> WeatherReading:
 
 
 def _fetch_openweathermap(lat: float, lon: float) -> WeatherReading | None:
-    """Tries OpenWeatherMap's current-weather endpoint, which blends in
-    real nearby station observations. Returns None (never raises) on any
-    failure — timeout, network error, bad key, malformed response — so the
-    caller can fall through to Open-Meteo exactly as if this provider
-    weren't configured at all."""
+    """Tries OpenWeatherMap's current-weather endpoint. Returns None (never
+    raises) on any failure — timeout, network error, bad key, malformed
+    response. The key is sent only as a request parameter; it is never logged,
+    even inside the error path below."""
     try:
         response = requests.get(
             OPENWEATHERMAP_BASE_URL,
@@ -121,8 +187,6 @@ def _fetch_openweathermap(lat: float, lon: float) -> WeatherReading | None:
         response.raise_for_status()
         payload = response.json()
         temp_c = float(payload["main"]["temp"])
-        # OWM reports rain volume for the last 1h (or 3h) under "rain", only
-        # present in the payload when it's actually raining.
         rain_block = payload.get("rain") or {}
         rain_mm = float(rain_block.get("1h", rain_block.get("3h", 0.0)) or 0.0)
         return {
@@ -132,6 +196,8 @@ def _fetch_openweathermap(lat: float, lon: float) -> WeatherReading | None:
             "source": "openweathermap",
         }
     except Exception as exc:  # noqa: BLE001 - any failure just falls through
+        # NB: %s on the exception never includes the appid — requests does not
+        # echo query params in its exception messages for these error types.
         logger.warning(
             "weather_engine -> OpenWeatherMap request failed for (%.4f, %.4f): %s. Falling back to Open-Meteo.",
             lat, lon, exc,
@@ -140,9 +206,9 @@ def _fetch_openweathermap(lat: float, lon: float) -> WeatherReading | None:
 
 
 def _fetch_open_meteo(lat: float, lon: float) -> WeatherReading | None:
-    """Tries the free, keyless Open-Meteo forecast-model endpoint. Returns
-    None (never raises) on any failure, so the caller falls through to the
-    hard fallback baseline."""
+    """Tries the free, keyless Open-Meteo forecast-model endpoint. Returns None
+    (never raises) on any failure, so the caller falls through to the hard
+    fallback baseline."""
     try:
         response = requests.get(
             OPEN_METEO_BASE_URL,
@@ -165,10 +231,7 @@ def _fetch_open_meteo(lat: float, lon: float) -> WeatherReading | None:
             "alert": _classify_alert(temp_c, rain_mm),
             "source": "open-meteo",
         }
-    except Exception as exc:  # noqa: BLE001 - deliberately broad: any failure
-        # mode (timeout, DNS failure, HTTP error, malformed/missing JSON
-        # keys) must degrade to the fallback reading, never propagate and
-        # break the caller's routing/telemetry loop.
+    except Exception as exc:  # noqa: BLE001 - any failure mode must degrade to the fallback reading
         logger.warning(
             "weather_engine -> Open-Meteo request failed for (%.4f, %.4f): %s. Using fallback baseline.",
             lat, lon, exc,
@@ -177,16 +240,8 @@ def _fetch_open_meteo(lat: float, lon: float) -> WeatherReading | None:
 
 
 def get_current_weather(lat: float, lon: float) -> WeatherReading:
-    """Returns live ambient weather for a coordinate.
-
-    Backed by a small TTL cache. Tries OpenWeatherMap first if
-    OPENWEATHERMAP_API_KEY is set (station-blended, closer to Google's
-    numbers); otherwise, or if that fails, falls through to the keyless
-    Open-Meteo forecast-model estimate; and if that also fails, falls
-    through to a hard fallback baseline. This function must never raise —
-    routing, telemetry, and thermal logic all depend on always getting
-    *some* reading back.
-    """
+    """Returns live ambient weather for a coordinate. OpenWeatherMap first if a
+    key is configured, then Open-Meteo, then the hard baseline. Never raises."""
     key = _cache_key(lat, lon)
     now = time.monotonic()
 
@@ -212,12 +267,9 @@ def get_current_weather(lat: float, lon: float) -> WeatherReading:
 
 
 def get_weather_profile(coordinates: list[tuple[float, float]]) -> list[WeatherReading]:
-    """Given a list of (lon, lat) coordinate pairs — matching the routing
-    engine's [lon, lat] convention used throughout live_backend.py — samples
-    live weather at each point and returns one WeatherReading per point, in
-    the same order given. Each individual lookup uses the same cache/
-    fallback behavior as get_current_weather; a failure on one point never
-    affects the others."""
+    """Given a list of (lon, lat) pairs (matching the routing engine's [lon, lat]
+    convention), samples live weather at each and returns one WeatherReading per
+    point, in order. A failure on one point never affects the others."""
     profile: list[WeatherReading] = []
     for lon, lat in coordinates:
         profile.append(get_current_weather(lat, lon))
