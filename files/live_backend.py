@@ -37,8 +37,22 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from scipy.spatial import cKDTree
 
-import nc_road_network as ncr
+# Prefer the improved road-network module (spatial-KNN imputation, connectivity
+# stitching, precomputed spoilage_cost_edge); fall back to the original.
+try:
+    import nc_road_network_improved as ncr
+except ImportError:
+    import nc_road_network as ncr
 import weather_engine
+
+# Precise Northern Cape province polygon, used to clip the routable graph so no
+# optimal path ever leaves the province (the OSM extract was bbox-clipped, which
+# let North West roads leak in). Optional import: if absent, routing falls back
+# to the un-clipped graph with a logged warning.
+try:
+    import nc_boundary
+except ImportError:  # pragma: no cover
+    nc_boundary = None
 
 # vrp_simulation_generator.py is a sibling deliverable (Monte Carlo risk
 # solver + Stream A/B/C synthetic generators). Imported lazily/optionally,
@@ -136,12 +150,18 @@ IDLE_WARMING_TARGET_OFFSET_COLD_C = -1.0      # cold climate: equilibrium sits b
 MOTION_DETECTION_DISTANCE_M = 25.0
 MOTION_DETECTION_SPEED_KMH = 1.0
 
+# Hardware trip evaluation: how many recent GPS pings to retain for the
+# sim-vs-real comparison, and how close (km) a ping must be to the simulated
+# optimal corridor to count as "on route".
+HARDWARE_PING_HISTORY_MAX = 2000
+ROUTE_ADHERENCE_KM = 5.0
+
 # Live ambient weather at the vehicle's current position, refreshed on every
 # /v1/telematics/truck-01 poll (see get_telematics) and read by the AI
 # Strategy Layer and the /v1/routing/weather-profile endpoint. Plain dict
 # read/write (no lock) for the same reason as live_settings above: a handful
 # of GIL-atomic scalar fields, briefly reading mid-update has no consequence.
-CURRENT_WEATHER: dict = {"temp_c": 25.0, "rain_mm": 0.0, "alert": "Normal"}
+CURRENT_WEATHER: dict = {"temp_c": 25.0, "rain_mm": 0.0, "alert": "Normal", "source": "unknown"}
 
 # Runtime-adjustable business thresholds. Cooperative dispatchers know their
 # own cargo (species, packaging, ice quality) better than any hardcoded
@@ -413,6 +433,14 @@ class StrategyRequest(BaseModel):
     standard_route_profile: str | None = None
     optimized_route_profile: str | None = None
     route_rationale_text: str | None = None
+    # Hardware sim-vs-real evaluation inputs. When evaluation_mode == "hardware"
+    # the memo adds a "## Simulation vs Real Trip" section grading how closely the
+    # real trip tracked the simulation and how to close the gap.
+    evaluation_mode: str | None = None
+    validation_score: float | None = None
+    route_adherence_pct: float | None = None
+    actual_vs_planned_time_pct: float | None = None
+    sim_vs_real_text: str | None = None
 
 
 # Lazily loaded, then cached for the life of the process — loading the model
@@ -561,6 +589,13 @@ trip_state: dict = {
     "hardware_motion_detected": False,
     "hardware_reference_lat": None,
     "hardware_reference_lon": None,
+    # --- Hardware sim-vs-real evaluation (the feedback-loop validation) -------
+    # The frozen "as-simulated" plan (optimized route + Monte Carlo estimate),
+    # captured at the first fix, plus the real trip's ping history and the peak
+    # cargo temperature actually observed — compared in /v1/hardware/trip-evaluation.
+    "hardware_sim_plan": None,
+    "hardware_ping_history": [],
+    "hardware_max_cargo_temp_c": None,
 }
 
 active_driver_reports: dict[tuple[int, int], dict] = {}
@@ -578,6 +613,34 @@ def load_topology() -> tuple[nx.Graph, set, dict[int, tuple[float, float]]]:
     with GRAPH_PATH.open("rb") as f:
         artifacts = pickle.load(f)
     return artifacts["G_main"], artifacts["main_nodes"], artifacts["cluster_coord"]
+
+
+def restrict_topology_to_northern_cape(topology: nx.Graph, coords: dict[int, tuple[float, float]]):
+    """Clips the routable graph to the Northern Cape province polygon (+border
+    buffer), then returns its largest connected component. This is the routing-
+    time enforcement of the province boundary: even though the on-disk graph
+    still contains North West / Free State roads that fell inside the extract's
+    bounding box, only NC-eligible nodes survive here, so shortest_path can never
+    route through another province. Returns (G_nc, nc_nodes, removed_count)."""
+    if nc_boundary is None:
+        return topology, set(topology.nodes()), 0
+
+    border_posts = getattr(ncr, "BORDER_POSTS", None)
+    eligible = {
+        n for n in topology.nodes()
+        if nc_boundary.node_eligible(coords[n][0], coords[n][1], border_posts)
+    }
+    removed = topology.number_of_nodes() - len(eligible)
+    if not eligible:
+        logger.warning("NC clip -> no eligible nodes found; keeping the un-clipped graph.")
+        return topology, set(topology.nodes()), 0
+
+    sub = topology.subgraph(eligible).copy()
+    components = (nx.weakly_connected_components(sub) if sub.is_directed()
+                 else nx.connected_components(sub))
+    largest = max(components, key=len)
+    g_nc = sub.subgraph(largest).copy()
+    return g_nc, set(g_nc.nodes()), removed
 
 
 def initialize_baseline_impedance(topology: nx.Graph) -> None:
@@ -691,6 +754,22 @@ class EdgeSpatialIndex:
 logger.info("Loading network topology from %s", GRAPH_PATH)
 live_topology, main_nodes, cluster_coord = load_topology()
 initialize_baseline_impedance(live_topology)
+
+# Clip the routable graph to the Northern Cape province polygon so every optimal
+# path stays inside the province (fixes routes that dipped into North West via
+# the N14 corridor above Kimberley). Applies to BOTH simulator and live-hardware
+# routing, since both go through this one graph.
+if nc_boundary is not None:
+    _nodes_before = live_topology.number_of_nodes()
+    live_topology, main_nodes, _removed = restrict_topology_to_northern_cape(live_topology, cluster_coord)
+    logger.info(
+        "NC clip -> routable graph restricted to %d/%d nodes inside Northern Cape "
+        "(+%.0fkm border buffer); %d out-of-province nodes dropped.",
+        live_topology.number_of_nodes(), _nodes_before, nc_boundary.BORDER_INCLUDE_KM, _removed,
+    )
+else:
+    logger.warning("NC clip -> nc_boundary module not found; routing on the un-clipped (bbox) graph.")
+
 logger.info(
     "Topology ready: %d nodes, %d edges, spoilage_cost impedance initialized",
     live_topology.number_of_nodes(),
@@ -792,6 +871,10 @@ ROUGH_FCLASSES = {
 
 def _node_outside_nc(node: int) -> bool:
     lon, lat = cluster_coord[node]
+    # Precise province-polygon test when available (with the same border buffer
+    # the routing clip uses); falls back to the rectangular bbox otherwise.
+    if nc_boundary is not None:
+        return not nc_boundary.node_eligible(lon, lat, getattr(ncr, "BORDER_POSTS", None))
     return not (
         NC_BBOX["min_lon"] - NC_BBOX_TOLERANCE_DEG <= lon <= NC_BBOX["max_lon"] + NC_BBOX_TOLERANCE_DEG
         and NC_BBOX["min_lat"] - NC_BBOX_TOLERANCE_DEG <= lat <= NC_BBOX["max_lat"] + NC_BBOX_TOLERANCE_DEG
@@ -886,6 +969,168 @@ def build_route_rationale(standard: dict, optimized: dict,
         "optimized_summary": optimized_summary,
         "reason": reason,
         "boundary_note": boundary_note,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Hardware sim-vs-real evaluation — the feedback-loop validation
+# ---------------------------------------------------------------------------
+def _haversine_km(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
+    r = 6371.0088
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return r * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def _point_to_polyline_km(lon: float, lat: float, coords: list) -> float:
+    """Minimum distance (km) from a point to a [lon,lat] polyline, via true
+    point-to-segment projection in a local equirectangular plane."""
+    if not coords:
+        return float("inf")
+    if len(coords) == 1:
+        return _haversine_km(lon, lat, coords[0][0], coords[0][1])
+    mx = 111_320.0 * math.cos(math.radians(lat))
+    my = 110_540.0
+    px, py = lon * mx, lat * my
+    best = float("inf")
+    for a, b in zip(coords[:-1], coords[1:]):
+        ax, ay = a[0] * mx, a[1] * my
+        bx, by = b[0] * mx, b[1] * my
+        dx, dy = bx - ax, by - ay
+        seg_len_sq = dx * dx + dy * dy
+        if seg_len_sq == 0.0:
+            dist = math.hypot(px - ax, py - ay)
+        else:
+            t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / seg_len_sq))
+            projx, projy = ax + t * dx, ay + t * dy
+            dist = math.hypot(px - projx, py - projy)
+        best = min(best, dist)
+    return best / 1000.0
+
+
+def freeze_hardware_sim_plan(origin_node: int, destination_node: int, optimized: dict) -> dict:
+    """Captures the 'as-simulated' plan at the first GPS fix of a hardware trip:
+    the spoilage-optimized route and (if the Monte Carlo module is available) a
+    stochastic risk estimate. This is the yardstick the real trip is measured
+    against in /v1/hardware/trip-evaluation."""
+    summary = summarize_route(optimized["path_nodes"])
+    plan = {
+        "destination_town": trip_state["destination_town"],
+        "planned_route_coordinates": optimized["coordinates"],
+        "planned_path_nodes": optimized["path_nodes"],
+        "planned_time_mins": optimized["total_time_mins"],
+        "planned_km": summary["total_km"],
+        "planned_rough_km": summary["rough_km"],
+        "planned_spoilage_pct": optimized["spoilage_risk_pct"],
+        "planned_surface_profile": summary["profile"],
+        "frozen_at_ts": int(time.time()),
+        "monte_carlo": None,
+    }
+    if vrpsim is not None:
+        try:
+            mc = vrpsim.run_monte_carlo_risk_analysis(
+                live_topology, cluster_coord, origin_node, destination_node,
+                datetime.now(timezone.utc) + timedelta(minutes=2),
+                iterations=200, shipment_value_rand=live_settings["shipment_value_rand"],
+            )
+            plan["monte_carlo"] = {
+                key: mc[key] for key in (
+                    "expected_journey_time_mins", "prob_total_spoilage_pct",
+                    "value_at_risk_95_rand", "worst_peak_cargo_temp_c",
+                ) if key in mc
+            }
+        except Exception as exc:  # noqa: BLE001 - MC is a nice-to-have; the plan still stands without it
+            logger.warning("HARDWARE SIM PLAN -> Monte Carlo estimate failed: %s", exc)
+    logger.info(
+        "HARDWARE SIM PLAN frozen -> dest=%s planned_time=%.0fmin planned_km=%.0f spoilage=%.1f%%",
+        plan["destination_town"], plan["planned_time_mins"], plan["planned_km"], plan["planned_spoilage_pct"],
+    )
+    return plan
+
+
+def evaluate_hardware_trip(sim_plan: dict, pings: list, max_cargo_c: float | None) -> dict:
+    """Deterministic simulation-vs-real comparison: how faithfully the real trip
+    tracked the simulated optimal plan, plus concrete suggestions to close any
+    gap so future real trips converge on the simulation."""
+    pings_sorted = sorted(pings, key=lambda p: p["ts"])
+    coords_plan = sim_plan["planned_route_coordinates"]
+
+    actual_km = 0.0
+    for a, b in zip(pings_sorted[:-1], pings_sorted[1:]):
+        actual_km += _haversine_km(a["lon"], a["lat"], b["lon"], b["lat"])
+    elapsed_min = max(0.0, (pings_sorted[-1]["ts"] - pings_sorted[0]["ts"]) / 60.0)
+
+    adhered = sum(
+        1 for p in pings_sorted
+        if _point_to_polyline_km(p["lon"], p["lat"], coords_plan) <= ROUTE_ADHERENCE_KM
+    )
+    adherence_pct = adhered / len(pings_sorted) * 100.0
+
+    planned_time = sim_plan["planned_time_mins"]
+    planned_km = sim_plan["planned_km"]
+    time_ratio = (elapsed_min / planned_time) if planned_time > 0 else None
+    dist_ratio = (actual_km / planned_km) if planned_km > 0 else None
+
+    safe_max = live_settings["safe_temp_max_c"]
+
+    # Validation score: adherence (50%) + ETA closeness (30%) + thermal closeness (20%).
+    time_closeness = 100.0
+    if time_ratio is not None:
+        time_closeness = max(0.0, 100.0 - abs(time_ratio - 1.0) * 100.0)
+    thermal_closeness = 100.0
+    if max_cargo_c is not None:
+        thermal_closeness = 100.0 if max_cargo_c <= safe_max else max(0.0, 100.0 - (max_cargo_c - safe_max) * 12.0)
+    validation_score = round(0.5 * adherence_pct + 0.3 * time_closeness + 0.2 * thermal_closeness, 1)
+
+    suggestions: list[str] = []
+    if adherence_pct < 85.0:
+        suggestions.append(
+            f"The real route left the simulated optimal corridor on {100.0 - adherence_pct:.0f}% of pings. "
+            "Keeping the driver on the recommended route avoids rougher roads and makes the real trip match "
+            "the simulation."
+        )
+    if time_ratio is not None and time_ratio > 1.2:
+        suggestions.append(
+            f"The trip is running {(time_ratio - 1.0) * 100:.0f}% over the simulated ETA. Reduce unplanned "
+            "stops and border/queue idle to converge on the simulated duration."
+        )
+    if time_ratio is not None and time_ratio < 0.8:
+        suggestions.append(
+            f"The real trip is {(1.0 - time_ratio) * 100:.0f}% faster than simulated — the simulation's "
+            "speed assumptions for these road classes look too conservative; recalibrate DEFAULT_SPEED_KMH "
+            "upward for the classes on this corridor (see system_validation_test.py's self-calibration engine)."
+        )
+    if max_cargo_c is not None and max_cargo_c > safe_max:
+        suggestions.append(
+            f"Cargo peaked at {max_cargo_c:.1f} °C, above the {safe_max:.1f} °C safe threshold. Pre-cool the "
+            "reefer before departure and minimise door openings so the real thermal curve tracks the simulated one."
+        )
+    if not suggestions:
+        suggestions.append(
+            "The real trip closely matches the simulation on route, timing and temperature — the model is "
+            "validated for this corridor. Keep logging trips to widen the validated set."
+        )
+
+    return {
+        "status": "success",
+        "destination_town": sim_plan["destination_town"],
+        "route_adherence_pct": round(adherence_pct, 1),
+        "actual_km": round(actual_km, 1),
+        "planned_km": round(planned_km, 1),
+        "distance_ratio": round(dist_ratio, 2) if dist_ratio is not None else None,
+        "actual_elapsed_min": round(elapsed_min, 1),
+        "planned_time_mins": round(planned_time, 1),
+        "time_ratio": round(time_ratio, 2) if time_ratio is not None else None,
+        "actual_peak_cargo_temp_c": round(max_cargo_c, 2) if max_cargo_c is not None else None,
+        "safe_temp_max_c": safe_max,
+        "planned_spoilage_pct": sim_plan["planned_spoilage_pct"],
+        "planned_surface_profile": sim_plan.get("planned_surface_profile"),
+        "simulation_monte_carlo": sim_plan.get("monte_carlo"),
+        "num_pings": len(pings_sorted),
+        "validation_score": validation_score,
+        "suggestions": suggestions,
     }
 
 
@@ -1041,6 +1286,19 @@ def list_towns() -> dict:
     return {"towns": AVAILABLE_TOWNS}
 
 
+@app.get("/v1/weather/status")
+def weather_status() -> dict:
+    """Reports whether an OpenWeatherMap key is configured and which provider
+    last answered — WITHOUT ever exposing the key itself. Lets the dashboard say
+    'key configured but OWM fell back' (e.g. a brand-new key can take ~2h to
+    activate) instead of the misleading 'no key detected'."""
+    return {
+        "key_configured": bool(OPENWEATHERMAP_API_KEY),
+        "preferred_provider": "openweathermap" if OPENWEATHERMAP_API_KEY else "open-meteo",
+        "last_source": CURRENT_WEATHER.get("source", "unknown"),
+    }
+
+
 @app.get("/v1/settings/thresholds")
 def get_thresholds() -> dict:
     """Current business-adjustable thresholds. Read by the dashboard on load
@@ -1149,6 +1407,10 @@ def configure_trip(config: TripConfig) -> dict:
         trip_state["hardware_motion_detected"] = False
         trip_state["hardware_reference_lat"] = None
         trip_state["hardware_reference_lon"] = None
+        # Reset the hardware sim-vs-real evaluation state for the new trip.
+        trip_state["hardware_sim_plan"] = None
+        trip_state["hardware_ping_history"] = []
+        trip_state["hardware_max_cargo_temp_c"] = None
 
         trip_state["configured"] = True
 
@@ -1204,6 +1466,17 @@ async def telematics_incoming(request: Request) -> dict:
         tracking_state["feed_source"] = FEED_SOURCE_REAL
         tracking_state["speed_kmh"] = speed if speed is not None else tracking_state.get("speed_kmh", 0.0)
         tracking_state["bearing"] = bearing if bearing is not None else tracking_state.get("bearing", 0.0)
+
+        # Retain the ping for the hardware sim-vs-real evaluation (real trip path).
+        if trip_state["configured"] and trip_state["mode"] == "hardware":
+            history = trip_state["hardware_ping_history"]
+            history.append({
+                "lat": lat, "lon": lon,
+                "ts": tracking_state["timestamp"],
+                "speed": speed if speed is not None else 0.0,
+            })
+            if len(history) > HARDWARE_PING_HISTORY_MAX:
+                del history[: len(history) - HARDWARE_PING_HISTORY_MAX]
 
         # Motion detection for hardware mode: cargo risk metrics stay frozen
         # (see get_telematics) until the truck has genuinely moved, not just
@@ -1279,6 +1552,10 @@ def get_telematics() -> dict:
             CURRENT_WEATHER["temp_c"] = weather_reading["temp_c"]
             CURRENT_WEATHER["rain_mm"] = weather_reading["rain_mm"]
             CURRENT_WEATHER["alert"] = weather_reading["alert"]
+            # Store which provider actually answered, so the dashboard can label
+            # the source correctly (previously this was never set, which made the
+            # Weather tab always read "Open-Meteo" even on OpenWeatherMap data).
+            CURRENT_WEATHER["source"] = weather_reading.get("source", "unknown")
 
         mechanical_risk_pct: float | None = None
         thermal_risk_pct: float
@@ -1370,6 +1647,15 @@ def get_telematics() -> dict:
             composite_cargo_risk_pct / 100.0 * live_settings["shipment_value_rand"], -2
         )
 
+        # Track the peak cargo temperature actually observed on a moving hardware
+        # trip, for the sim-vs-real evaluation.
+        if trip_state["configured"] and trip_state["mode"] == "hardware" and trip_state["hardware_motion_detected"]:
+            current_cargo = tracking_state["cargo_temp_c"]
+            previous_peak = trip_state["hardware_max_cargo_temp_c"]
+            trip_state["hardware_max_cargo_temp_c"] = (
+                current_cargo if previous_peak is None else max(previous_peak, current_cargo)
+            )
+
         payload = dict(tracking_state)
         awaiting_motion = (
             trip_state["configured"]
@@ -1433,6 +1719,16 @@ def get_routing() -> dict:
     optimized = build_route(origin_node, destination_node, spoilage_weight)
     standard = build_route(origin_node, destination_node, time_weight)
 
+    # Hardware mode: freeze the 'as-simulated' plan on the first routing call
+    # (the truck's first fix ≈ origin), so the real trip can later be evaluated
+    # against it in /v1/hardware/trip-evaluation.
+    if mode == "hardware" and trip_state["hardware_sim_plan"] is None:
+        with state_lock:
+            if trip_state["hardware_sim_plan"] is None:
+                trip_state["hardware_sim_plan"] = freeze_hardware_sim_plan(
+                    origin_node, destination_node, optimized
+                )
+
     time_saved_mins = round(standard["total_time_mins"] - optimized["total_time_mins"], 1)
     rand_saved = round(standard["expected_loss_rand"] - optimized["expected_loss_rand"], -2)
     detour_active = optimized["path_nodes"] != standard["path_nodes"]
@@ -1477,6 +1773,43 @@ def get_routing() -> dict:
         # kept for compatibility with older callers expecting a single "path"
         "path": optimized["coordinates"],
     }
+
+
+@app.get("/v1/hardware/trip-evaluation")
+def hardware_trip_evaluation() -> dict:
+    """Simulation-vs-real evaluation for a live hardware trip. Compares the real
+    trip (from Traccar pings) against the frozen simulated optimal plan: route
+    adherence, actual-vs-planned time and distance, peak cargo temperature, and a
+    validation score, plus concrete suggestions to make the real trip converge on
+    the simulation. Degrades to a clean JSON status while data is still building."""
+    with state_lock:
+        if not trip_state["configured"] or trip_state["mode"] != "hardware":
+            return {
+                "status": "unavailable",
+                "message": "Switch Telemetry Mode to Live Mobile Hardware Tracking and set a destination to "
+                           "evaluate the real trip against the simulation.",
+            }
+        sim_plan = trip_state["hardware_sim_plan"]
+        pings = list(trip_state["hardware_ping_history"])
+        max_cargo = trip_state["hardware_max_cargo_temp_c"]
+
+    if sim_plan is None:
+        return {
+            "status": "pending",
+            "message": "Simulation plan not frozen yet — open the Customer Route Tracker once (so the plan "
+                       "is computed from your first GPS fix), then drive the route.",
+        }
+    if len(pings) < 2:
+        return {
+            "status": "pending",
+            "message": "Not enough live telemetry yet — the evaluation appears once the truck has moved and "
+                       "sent a few Traccar pings.",
+        }
+    try:
+        return evaluate_hardware_trip(sim_plan, pings, max_cargo)
+    except Exception as exc:  # noqa: BLE001 - evaluation must degrade to JSON, never 500 the dashboard
+        logger.error("HARDWARE EVALUATION -> failed: %s", exc)
+        return {"status": "error", "message": f"Evaluation failed: {exc}"}
 
 
 @app.get("/v1/routing/weather-profile")
@@ -1670,6 +2003,19 @@ def generate_ai_strategy(payload: StrategyRequest) -> dict:
             f"- Live weather alert status: {payload.weather_alert or 'Normal'}\n"
         )
 
+    sim_vs_real_section = ""
+    if payload.evaluation_mode == "hardware":
+        sim_vs_real_section = (
+            "\nSIMULATION-VS-REAL FACTS (use these to write a '## Simulation vs Real Trip' section):\n"
+            f"- Validation score (0-100, how closely the real trip matched the simulation): "
+            f"{payload.validation_score if payload.validation_score is not None else 'n/a'}\n"
+            f"- Route adherence: {payload.route_adherence_pct if payload.route_adherence_pct is not None else 'n/a'}% "
+            "of pings stayed on the simulated optimal route\n"
+            f"- Actual trip duration vs simulated ETA: "
+            f"{payload.actual_vs_planned_time_pct if payload.actual_vs_planned_time_pct is not None else 'n/a'}% of plan\n"
+            f"- System-computed evaluation detail: {payload.sim_vs_real_text or 'n/a'}\n"
+        )
+
     route_justification_section = ""
     if payload.route_rationale_text or payload.standard_route_profile:
         route_justification_section = (
@@ -1697,6 +2043,7 @@ def generate_ai_strategy(payload: StrategyRequest) -> dict:
         f"- Road surface profile along the optimized route: {payload.surface_profile}\n"
         f"{weather_section}"
         f"{route_justification_section}"
+        f"{sim_vs_real_section}"
         f"- Total shipment value at risk: R {payload.shipment_value_rand:,.0f}\n\n"
         "INTERPRETATION GUIDANCE (read before writing):\n"
         "- If the optimized and standard route durations are equal and the Rand saved is R 0, this "
@@ -1717,7 +2064,12 @@ def generate_ai_strategy(payload: StrategyRequest) -> dict:
         "explains, in plain language for a non-technical manager, WHY the system chose this "
         "specific route and did NOT choose the standard route or any other road on the map — "
         "ground it in the rough-km-avoided and surface-profile numbers given, and if the two "
-        "routes are identical, say plainly that the fastest road is already the safest.\n\n"
+        "routes are identical, say plainly that the fastest road is already the safest. If "
+        "SIMULATION-VS-REAL FACTS were provided, include a '## Simulation vs Real Trip' section that "
+        "grades how closely the real trip matched the simulation (using the validation score and "
+        "adherence), states whether the simulation is validated for this corridor, and gives concrete "
+        "steps to make future real trips converge on the simulated optimum — the goal is a real trip "
+        "that is almost as perfect as the simulation predicted.\n\n"
         f"Reminder: this memo is specifically about the {payload.origin} -> {payload.destination} "
         f"route. Do not substitute any other town names. Do not write your own title, date, or "
         f"route line — begin directly with '## Introduction'."

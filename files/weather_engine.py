@@ -77,25 +77,41 @@ def _parse_dotenv_line(line: str) -> tuple[str, str] | None:
 
 
 def load_dotenv(dotenv_path: Path | None = None) -> bool:
-    """Loads a `.env` file from this module's folder (or an explicit path) into
-    os.environ, WITHOUT overriding variables already set in the real environment
-    (real env wins). Never raises, never logs any value. Returns True if a file
-    was found and read."""
-    path = dotenv_path or Path(__file__).resolve().with_name(".env")
-    try:
-        if not path.exists():
-            return False
-        for raw_line in path.read_text(encoding="utf-8").splitlines():
-            parsed = _parse_dotenv_line(raw_line)
-            if parsed is None:
+    """Loads `.env` into os.environ WITHOUT overriding variables already set in
+    the real environment (real env wins). Searches, in order: an explicit path if
+    given, then a `.env` next to THIS module, then a `.env` in the current working
+    directory (so it's found whether you run the backend from its own folder or
+    the project root). Never raises, never logs any value. Returns True if any
+    file was found and read."""
+    candidates: list[Path] = []
+    if dotenv_path is not None:
+        candidates.append(Path(dotenv_path))
+    else:
+        candidates.append(Path(__file__).resolve().with_name(".env"))
+        try:
+            candidates.append(Path.cwd() / ".env")
+        except Exception:  # noqa: BLE001 - cwd can be unavailable in odd contexts
+            pass
+
+    loaded_any = False
+    seen: set[str] = set()
+    for path in candidates:
+        try:
+            resolved = str(path.resolve())
+            if resolved in seen or not path.exists():
                 continue
-            key, value = parsed
-            os.environ.setdefault(key, value)  # real env var takes precedence
-        logger.info("weather_engine -> loaded environment overrides from %s (values not logged).", path.name)
-        return True
-    except Exception as exc:  # noqa: BLE001 - a malformed .env must never crash import
-        logger.warning("weather_engine -> could not read .env (%s); continuing without it.", exc)
-        return False
+            seen.add(resolved)
+            for raw_line in path.read_text(encoding="utf-8").splitlines():
+                parsed = _parse_dotenv_line(raw_line)
+                if parsed is None:
+                    continue
+                key, value = parsed
+                os.environ.setdefault(key, value)  # real env var, then first .env found, wins
+            logger.info("weather_engine -> loaded environment overrides from %s (values not logged).", path.name)
+            loaded_any = True
+        except Exception as exc:  # noqa: BLE001 - a malformed .env must never crash import
+            logger.warning("weather_engine -> could not read %s (%s); continuing.", path, exc)
+    return loaded_any
 
 
 def resolve_owm_api_key() -> str:

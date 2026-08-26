@@ -1290,8 +1290,86 @@ with tab_ai_report:
     strategy_routing = backend_get("/v1/routing/truck-01", silent=True)
     strategy_telematics = backend_get("/v1/telematics/truck-01", silent=True)
 
+    is_hardware_mode = st.session_state.telemetry_mode == MODE_HARDWARE
+
     if not st.session_state.trip_configured:
         st.info("Start a trip in the sidebar first — the report is built from that trip's live metrics.")
+    elif is_hardware_mode:
+        # ---- HARDWARE MODE: simulation-vs-real trip evaluation -------------
+        st.subheader("🛰️ Simulation vs Real Trip — Live Hardware Evaluation")
+        st.caption(
+            "Compares your live Traccar trip against the simulated optimal plan frozen at your first GPS "
+            "fix, grades how closely reality matched the simulation, and suggests how to make the real "
+            "trip converge on the simulated optimum. Success = a real trip almost as perfect as the plan."
+        )
+        ev = backend_get("/v1/hardware/trip-evaluation", silent=True)
+        if ev is None:
+            st.warning("Backend unreachable — cannot evaluate the trip.")
+        elif ev.get("status") != "success":
+            st.info(ev.get("message", "Evaluation not ready yet — drive the route so telemetry accumulates."))
+        else:
+            score = ev["validation_score"]
+            cells = st.columns(4)
+            cells[0].metric("Validation Score", f"{score:.0f}/100",
+                            help="How closely the real trip matched the simulation across route, timing and temperature.")
+            cells[1].metric("Route Adherence", f"{ev['route_adherence_pct']:.0f}%",
+                            help="Share of GPS pings that stayed on the simulated optimal corridor.")
+            cells[2].metric("Actual vs Planned Time", f"{ev['actual_elapsed_min']:.0f} / {ev['planned_time_mins']:.0f} min")
+            peak = ev.get("actual_peak_cargo_temp_c")
+            cells[3].metric("Peak Cargo Temp", f"{peak:.1f} °C" if peak is not None else "n/a")
+
+            cells2 = st.columns(3)
+            cells2[0].metric("Actual Distance", f"{ev['actual_km']:.0f} km")
+            cells2[1].metric("Planned Distance", f"{ev['planned_km']:.0f} km")
+            cells2[2].metric("Pings Evaluated", ev["num_pings"])
+
+            if score >= 85:
+                st.success(f"✅ Simulation VALIDATED for this corridor — the real trip matched the plan ({score:.0f}/100).")
+            elif score >= 60:
+                st.warning(f"🟡 Partial match ({score:.0f}/100) — see the steps below to close the gap.")
+            else:
+                st.error(f"🔴 The real trip diverged from the simulation ({score:.0f}/100) — see the steps below.")
+
+            st.markdown("**How to make the real trip match the simulation:**")
+            for suggestion in ev["suggestions"]:
+                st.markdown(f"- {suggestion}")
+
+            if st.button("💡 Generate AI Simulation-vs-Real Report", use_container_width=True):
+                amb = (strategy_telematics or {}).get("ambient_weather") or {}
+                time_pct = round(ev["time_ratio"] * 100.0, 0) if ev.get("time_ratio") is not None else None
+                sim_text = (
+                    f"Route adherence {ev['route_adherence_pct']:.0f}%; actual {ev['actual_elapsed_min']:.0f} min "
+                    f"vs planned {ev['planned_time_mins']:.0f} min; peak cargo "
+                    f"{ev.get('actual_peak_cargo_temp_c')} °C; validation {score:.0f}/100. "
+                    + " ".join(ev["suggestions"])
+                )
+                eval_payload = {
+                    "origin": "Live start position",
+                    "destination": ev.get("destination_town", ""),
+                    "standard_time_mins": ev["planned_time_mins"],
+                    "optimized_time_mins": ev["actual_elapsed_min"],
+                    "rand_saved": 0.0,
+                    "mechanical_risk_reduction_pct": 0.0,
+                    "thermal_risk_pct": (strategy_telematics or {}).get("thermal_risk_pct", 0.0),
+                    "cargo_temp_status": (strategy_telematics or {}).get("cargo_temp_status", "Unknown"),
+                    "surface_profile": ev.get("planned_surface_profile") or "unknown",
+                    "shipment_value_rand": float(st.session_state.shipment_value_rand),
+                    "ambient_temp_c": amb.get("temp_c"),
+                    "rain_mm": amb.get("rain_mm"),
+                    "weather_alert": amb.get("alert"),
+                    "evaluation_mode": "hardware",
+                    "validation_score": score,
+                    "route_adherence_pct": ev["route_adherence_pct"],
+                    "actual_vs_planned_time_pct": time_pct,
+                    "sim_vs_real_text": sim_text,
+                }
+                with st.spinner("🤖 Local model compiling the simulation-vs-real evaluation... (typically 3-6 minutes on CPU)"):
+                    eval_result = backend_post("/v1/analytics/strategy", json_body=eval_payload, timeout=600)
+                if eval_result is not None:
+                    if eval_result.get("status") == "success":
+                        st.markdown(eval_result["strategy_markdown"])
+                    else:
+                        st.error(eval_result.get("message", "AI evaluation report failed."))
     elif strategy_routing is None or strategy_routing.get("trip_plan") is None:
         st.caption("Trip plan unavailable yet — start a simulator trip to generate a strategy report.")
     else:
@@ -1426,30 +1504,43 @@ with tab_weather:
     def weather_tab_view():
         weather_telematics = backend_get("/v1/telematics/truck-01", silent=True)
         active_weather_source = ((weather_telematics or {}).get("ambient_weather") or {}).get("source")
+        wstatus = backend_get("/v1/weather/status", silent=True) or {}
+        key_configured = bool(wstatus.get("key_configured", False))
 
         with wui["source_info"].container():
             if active_weather_source == "openweathermap":
                 st.caption(
-                    "🟢 Source: **OpenWeatherMap** (your API key was detected). Readings blend in "
-                    "nearby station observations, so they track closely with sites like Google "
+                    "🟢 Source: **OpenWeatherMap** (your API key was detected and is answering). Readings "
+                    "blend in nearby station observations, so they track closely with sites like Google "
                     "Weather. The key is loaded from your local `.env` and is never shown here."
+                )
+            elif key_configured:
+                # Key IS configured, but this reading came from Open-Meteo / the
+                # baseline. The usual cause is a brand-new OWM key that hasn't
+                # activated yet (can take up to ~2 hours), or a transient timeout.
+                shown = "baseline fallback" if active_weather_source == "fallback" else "Open-Meteo"
+                st.caption(
+                    f"🟡 Your **OpenWeatherMap key IS configured**, but the reading right now came from "
+                    f"**{shown}**. A newly-created OWM key can take up to ~2 hours to activate (or the last "
+                    "call timed out) — the dashboard switches to OpenWeatherMap automatically once its API "
+                    "starts responding. Nothing else to do."
                 )
             elif active_weather_source == "fallback":
                 st.caption(
-                    "🟠 Source: **baseline fallback** (25 °C / 0 mm) — the live weather providers "
-                    "could not be reached just now. Routing and telemetry keep working; readings "
-                    "refresh automatically when a provider responds again."
+                    "🟠 Source: **baseline fallback** (25 °C / 0 mm) — the live weather providers could not "
+                    "be reached just now. Routing and telemetry keep working; readings refresh automatically "
+                    "when a provider responds again."
                 )
             else:
                 st.caption(
-                    "🔵 Source: **Open-Meteo** (keyless forecast-model estimate). No OpenWeatherMap "
-                    "key was detected."
+                    "🔵 Source: **Open-Meteo** (keyless forecast-model estimate). No OpenWeatherMap key was "
+                    "detected on the backend."
                 )
                 st.caption(
-                    "ℹ️ These are a live forecast-model estimate for the exact coordinate, not a "
-                    "nearby weather-station observation. To switch to station-blended OpenWeatherMap "
-                    "readings, drop `API_KEY = \"...\"` into a `.env` file next to weather_engine.py "
-                    "(free tier at openweathermap.org) and restart the backend."
+                    "ℹ️ These are a live forecast-model estimate for the exact coordinate, not a nearby "
+                    "weather-station observation. To switch to station-blended OpenWeatherMap readings, drop "
+                    "`API_KEY = \"...\"` into a `.env` file next to weather_engine.py (free tier at "
+                    "openweathermap.org) and **restart the backend** so it reloads the key."
                 )
 
         ambient = (weather_telematics or {}).get("ambient_weather") or {

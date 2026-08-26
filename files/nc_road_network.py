@@ -54,6 +54,13 @@ import networkx as nx
 from pyproj import Geod
 from scipy.spatial import cKDTree
 
+# Precise Northern Cape province polygon for clipping the extract to the actual
+# province (not just its bounding box). Optional: if absent, clipping is skipped.
+try:
+    import nc_boundary
+except ImportError:  # pragma: no cover
+    nc_boundary = None
+
 logger = logging.getLogger("nc_road_network")
 
 GEOD = Geod(ellps="WGS84")
@@ -298,9 +305,37 @@ def normalize_road_name(fclass, name=None, ref=None):
     return f"Unnamed {label} road"
 
 
+def filter_to_northern_cape(gdf, border_km=25.0):
+    """Keeps only road segments whose representative point lies inside the
+    Northern Cape province polygon (or within `border_km` of a border post).
+    The raw extract was clipped to a rectangular bbox, which included North West
+    / Free State roads above Kimberley; this removes them so the routable graph —
+    and therefore every optimal path — stays inside the province. No-op (returns
+    gdf unchanged, with a warning) if nc_boundary isn't importable."""
+    if nc_boundary is None:
+        logger.warning("filter_to_northern_cape -> nc_boundary not found; skipping province clip.")
+        return gdf
+    reps = gdf.geometry.representative_point()
+    lons = reps.x.to_numpy()
+    lats = reps.y.to_numpy()
+    keep = np.fromiter(
+        (nc_boundary.node_eligible(float(lons[i]), float(lats[i]), BORDER_POSTS, border_km)
+         for i in range(len(gdf))),
+        dtype=bool, count=len(gdf),
+    )
+    kept = gdf[keep].copy()
+    logger.info("filter_to_northern_cape -> kept %d/%d segments inside Northern Cape.", len(kept), len(gdf))
+    return kept
+
+
 def clean_and_enrich(gdf, exclude_fclass=EXCLUDE_FCLASS,
-                     simplify_tol=SIMPLIFY_TOLERANCE_DEG, use_spatial_knn=True):
+                     simplify_tol=SIMPLIFY_TOLERANCE_DEG, use_spatial_knn=True,
+                     clip_to_nc=True):
     gdf = gdf[~gdf["fclass"].isin(exclude_fclass)].copy()
+    # Province clip FIRST, so all downstream work (imputation, graph build) only
+    # ever sees Northern Cape roads.
+    if clip_to_nc:
+        gdf = filter_to_northern_cape(gdf)
     gdf["geometry"] = gdf.geometry.simplify(tolerance=simplify_tol, preserve_topology=True)
 
     gdf["length_km"] = gdf.geometry.apply(lambda g: GEOD.geometry_length(g) / 1000)
