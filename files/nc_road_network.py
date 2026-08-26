@@ -116,6 +116,31 @@ KNN_MIN_OBSERVED = 8
 # Spoilage weighting non-linearity. 1.0 reproduces the original exactly.
 SPOILAGE_ROUGHNESS_EXPONENT = 1.0
 
+# --- Two-component spoilage weight (thermal + mechanical) -------------------
+# Cold-chain spoilage risk on an edge grows with TIME in BOTH physical channels
+# (this is the same 50/50 split the dashboard already reports in
+# metrics_explained.md, now used for ROUTING too, not just the risk %):
+#   thermal    (heat exposure)   ~ travel_time                 -> weight THERMAL_WEIGHT
+#   mechanical (vibration/seal)  ~ travel_time * roughness      -> weight MECH_WEIGHT
+#   spoilage_cost = travel_time * (THERMAL_WEIGHT + MECH_WEIGHT * roughness**exp)
+#
+# WHY THIS MATTERS: the previous weight was travel_time * roughness, i.e. a pure
+# roughness multiplier. That let the optimizer accept a route nearly TWICE as
+# long in TIME just to stay on smooth roads — which defeats the cold-chain
+# purpose, because time on the road IS thermal spoilage. Making time a
+# first-class, weighted term means the optimizer only takes a longer route when
+# it is genuinely faster (paved) or when the roughness it avoids costs more
+# spoilage than the extra time adds. THERMAL_WEIGHT + MECH_WEIGHT*1.0 == 1.0, so
+# a smooth (roughness 1.0) edge costs exactly its travel time. Lower MECH_WEIGHT
+# to make routes shorter/more time-direct; raise it to weight roughness more.
+THERMAL_WEIGHT = 0.5
+MECH_WEIGHT = 0.5
+
+
+def spoilage_edge_cost(travel_time_hr, roughness, exponent=SPOILAGE_ROUGHNESS_EXPONENT):
+    """Two-component (thermal + mechanical) spoilage cost for one edge."""
+    return travel_time_hr * (THERMAL_WEIGHT + MECH_WEIGHT * (roughness ** exponent))
+
 TOWNS = {
     "Kimberley": (24.7499, -28.7282), "Upington": (21.2561, -28.4478),
     "Springbok": (17.8865, -29.6644), "Kuruman": (23.4333, -27.4531),
@@ -348,7 +373,9 @@ def clean_and_enrich(gdf, exclude_fclass=EXCLUDE_FCLASS,
     # Precomputed, non-linear spoilage cost carried on the edge table, so the
     # whole system can share one definition (the backend now prefers a
     # precomputed spoilage_cost when present). Default exponent 1.0 == original.
-    gdf["spoilage_cost_edge"] = gdf["travel_time_hr"] * (gdf["roughness"] ** SPOILAGE_ROUGHNESS_EXPONENT)
+    gdf["spoilage_cost_edge"] = gdf["travel_time_hr"] * (
+        THERMAL_WEIGHT + MECH_WEIGHT * (gdf["roughness"] ** SPOILAGE_ROUGHNESS_EXPONENT)
+    )
 
     speed_lookup = gdf.groupby("fclass")["imputed_speed_kmh"].median().to_dict()
     return gdf, speed_lookup
@@ -448,7 +475,7 @@ def stitch_components(G, cluster_coord, bridge_max_m=BRIDGE_MAX_M,
             node_a, node_b,
             length_km=seg_len_km, travel_time=seg_time_hr,
             fclass="connector", roughness=roughness,
-            spoilage_cost_edge=seg_time_hr * (roughness ** SPOILAGE_ROUGHNESS_EXPONENT),
+            spoilage_cost_edge=spoilage_edge_cost(seg_time_hr, roughness),
             road_name="Inferred connector", road_ref=None, inferred=True,
         )
         union(node_to_comp[node_a], node_to_comp[node_b])
@@ -507,7 +534,7 @@ def build_graph(gdf, snap_tol_m=SNAP_TOLERANCE_M, stitch=True, bridge_max_m=BRID
         seg_len_km = GEOD.line_length([u[0], v[0]], [u[1], v[1]]) / 1000
         seg_time_hr = seg_len_km / speed if speed > 0 else 0.0
         if spoilage_edge is None or (isinstance(spoilage_edge, float) and np.isnan(spoilage_edge)):
-            spoilage_edge = seg_time_hr * (roughness ** SPOILAGE_ROUGHNESS_EXPONENT)
+            spoilage_edge = spoilage_edge_cost(seg_time_hr, roughness)
         G.add_edge(cu, cv, length_km=seg_len_km, travel_time=seg_time_hr,
                    fclass=fclass, roughness=roughness,
                    spoilage_cost_edge=spoilage_edge,
@@ -566,7 +593,7 @@ def build_directed_graph(gdf, snap_tol_m=SNAP_TOLERANCE_M, stitch=True, bridge_m
         seg_len_km = GEOD.line_length([u[0], v[0]], [u[1], v[1]]) / 1000
         seg_time_hr = seg_len_km / speed if speed > 0 else 0.0
         if spoilage_edge is None or (isinstance(spoilage_edge, float) and np.isnan(spoilage_edge)):
-            spoilage_edge = seg_time_hr * (roughness ** SPOILAGE_ROUGHNESS_EXPONENT)
+            spoilage_edge = spoilage_edge_cost(seg_time_hr, roughness)
         G.add_edge(cu, cv, length_km=seg_len_km, travel_time=seg_time_hr,
                    fclass=fclass, roughness=roughness, spoilage_cost_edge=spoilage_edge,
                    road_name=normalize_road_name(fclass, name, ref),
@@ -642,7 +669,7 @@ def make_spoilage_weight(border_nodes, roughness_exponent=SPOILAGE_ROUGHNESS_EXP
         if "spoilage_cost_edge" in d and d["spoilage_cost_edge"] is not None:
             spoilage = d["spoilage_cost_edge"]
         else:
-            spoilage = d["travel_time"] * (d.get("roughness", 1.3) ** roughness_exponent)
+            spoilage = spoilage_edge_cost(d["travel_time"], d.get("roughness", 1.3), roughness_exponent)
         if v in border_nodes:
             spoilage += border_nodes[v] * IDLE_HEAT_RISK_FACTOR
         return spoilage
@@ -658,7 +685,7 @@ def evaluate_path(G, path, border_nodes, spoilage_threshold=20.0, shipment_value
         if "spoilage_cost_edge" in d and d["spoilage_cost_edge"] is not None:
             total_spoilage += d["spoilage_cost_edge"]
         else:
-            total_spoilage += d["travel_time"] * (d.get("roughness", 1.3) ** roughness_exponent)
+            total_spoilage += spoilage_edge_cost(d["travel_time"], d.get("roughness", 1.3), roughness_exponent)
         if v in border_nodes:
             delay = border_nodes[v]
             total_time += delay

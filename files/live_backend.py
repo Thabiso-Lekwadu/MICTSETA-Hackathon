@@ -74,6 +74,10 @@ except ImportError:  # pragma: no cover - exercised only before that file exists
 # instead of crashing the whole API process. The pipeline itself is loaded
 # lazily (see get_ai_strategy_pipeline) so importing the package here never
 # pays the multi-second/multi-GB model-load cost at server startup.
+#
+# NOTE: a decoupled OpenAI-compatible path (Ollama/Llamafile) is documented in
+# AI_INFERENCE_MICROSERVICE_GUIDE.md for when you want to scale inference out of
+# this process; this build runs the local Qwen model in-process as requested.
 try:
     from transformers import pipeline as hf_pipeline
 except ImportError:  # pragma: no cover - exercised only when the package is absent
@@ -100,6 +104,17 @@ SIM_TIME_ACCELERATION = 45.0
 # Business-value constants (mirrors fisheries_coldchain_optimizer.py)
 SPOILAGE_THRESHOLD = 20.0        # risk-hours budget before treated as total loss
 SHIPMENT_VALUE_RAND_DEFAULT = 450_000.0  # default only — live value is adjustable at runtime, see live_settings below
+
+# Two-component spoilage weight (thermal + mechanical), matching
+# nc_road_network_improved.spoilage_edge_cost and the 50/50 composite in
+# metrics_explained.md. TIME is a first-class term (thermal), so the router will
+# NOT pick a route that is much longer in TIME just to avoid roughness — the fix
+# for "why is the optimal route so long". A smooth (roughness 1.0) edge costs
+# exactly its travel time (THERMAL_SPOIL_WEIGHT + MECH_SPOIL_WEIGHT == 1.0). Used
+# for the fallback when the graph doesn't carry a precomputed spoilage_cost_edge,
+# and for live driver-report overrides.
+THERMAL_SPOIL_WEIGHT = 0.5
+MECH_SPOIL_WEIGHT = 0.5
 
 # --- Thermal spoilage model -------------------------------------------------
 # Cold-chain spoilage has two genuinely different physical causes, and they're
@@ -372,12 +387,13 @@ def gps_fix_confidence(distance_km: float) -> str:
 
 
 # ---------------------------------------------------------------------------
-# AI Cognitive Strategy Layer — local Hugging Face model advisory config
+# AI Cognitive Strategy Layer — local Hugging Face (Qwen) model advisory config
 # ---------------------------------------------------------------------------
 # Small instruction-tuned model chosen specifically so it runs comfortably
-# CPU-only on a laptop with no separate daemon to install/start (unlike
-# Ollama) — `transformers` + this one line is the whole dependency.
-HF_STRATEGY_MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
+# CPU-only on a laptop with no separate daemon to install/start — `transformers`
+# + this one line is the whole dependency. Overridable by env in case you swap
+# in a different local HF model.
+HF_STRATEGY_MODEL = os.environ.get("HF_STRATEGY_MODEL", "Qwen/Qwen2.5-1.5B-Instruct")
 
 AI_STRATEGY_SYSTEM_PROMPT = (
     "You are an expert Logistics Econometrics Analyst and Cold-Chain Risk "
@@ -394,6 +410,22 @@ AI_STRATEGY_SYSTEM_PROMPT = (
     "     desert tracks versus paved corridors.\n"
     "  2. Thermal risk: temperature-exposure damage from the reefer unit "
     "     running above the safe carry threshold.\n\n"
+    "Beyond spoilage, quantify these three operating-cost and revenue levers "
+    "whenever the relevant figures are provided, tying each to a Rand impact:\n"
+    "  a. Fuel-burn idling cost at the Vioolsdrift border post: a reefer engine "
+    "     kept running to hold temperature while queued for customs burns diesel "
+    "     for zero distance. Treat every hour of border wait as a direct fuel and "
+    "     compressor-hours cost, and weigh it against departing in a slot with a "
+    "     shorter expected customs queue.\n"
+    "  b. Tyre and drivetrain wear relative to the International Roughness Index "
+    "     (IRI): kilometres on high-IRI corrugated/unpaved track accelerate tyre, "
+    "     suspension and seal wear far faster than smooth tar. Frame the rougher "
+    "     route's hidden maintenance cost, not just its spoilage cost.\n"
+    "  c. Premium market valuation of preserved seafood: cargo delivered within "
+    "     an unbroken cold chain commands a premium price (export/sashimi grade), "
+    "     while a thermal excursion downgrades it to a lower-value or condemned "
+    "     grade. Express the optimized route's benefit as protected premium "
+    "     revenue, not merely avoided loss.\n\n"
     "If live ambient weather figures are provided in the request, factor them "
     "briefly into your thermal-risk discussion — e.g. extreme heat straining "
     "the reefer condenser, or heavy rain raising washout risk on unpaved "
@@ -485,12 +517,12 @@ def extract_strategy_text(pipeline_output) -> str:
     return ""
 
 
-# A 1.5B model doesn't always follow "don't write a header" instructions
-# reliably, and when it does write one it can hallucinate the wrong town
-# names or an "[Insert Date]" placeholder. The real header is always built
-# from the actual request data in code (see generate_ai_strategy) — this
-# strips a handful of leading lines that look like a model-written title,
-# byline, or "Date:"/"Route:" line so the two headers can't collide/duplicate.
+# An instruction-tuned model doesn't always follow "don't write a header"
+# reliably, and when it does write one it can hallucinate the wrong town names
+# or an "[Insert Date]" placeholder. The real header is always built from the
+# actual request data in code (see generate_ai_strategy) — this strips a handful
+# of leading lines that look like a model-written title, byline, or
+# "Date:"/"Route:" line so the two headers can't collide/duplicate.
 _LEADING_HEADER_LINE_RE = re.compile(
     r"^\s*(#{1,3}\s*.*|(\*\*)?(date|route|to|memo|subject)(\*\*)?\s*:.*)\s*$",
     re.IGNORECASE,
@@ -661,7 +693,8 @@ def initialize_baseline_impedance(topology: nx.Graph) -> None:
         # older pickles keep working identically.
         precomputed_spoilage = edge_attrs.get("spoilage_cost_edge")
         edge_attrs["spoilage_cost"] = (
-            precomputed_spoilage if precomputed_spoilage is not None else travel_time_hr * roughness
+            precomputed_spoilage if precomputed_spoilage is not None
+            else travel_time_hr * (THERMAL_SPOIL_WEIGHT + MECH_SPOIL_WEIGHT * roughness)
         )
         edge_attrs["override"] = None
 
@@ -959,15 +992,50 @@ def build_route_rationale(standard: dict, optimized: dict,
             "Northern Cape envelope (bbox-edge clipping); treat those legs as approximate."
         )
 
+    opt_time = optimized["total_time_mins"]
+    std_time = standard["total_time_mins"]
+    opt_km = optimized_summary["total_km"]
+    std_km = standard_summary["total_km"]
+
+    # Panel-facing explanation of the distance-vs-time question ("why is the
+    # optimal route so long?"). The map shows KILOMETRES, but the objective
+    # minimizes SPOILAGE = time (thermal) + roughness×time (mechanical).
+    if not routes_differ:
+        panel_note = (
+            "The chosen route is identical to the fastest route — no distance/time trade-off to explain."
+        )
+    elif opt_time <= std_time + 1.0:
+        panel_note = (
+            f"Looks longer on the map ({opt_km:.0f} km vs {std_km:.0f} km) but is actually the SAME or "
+            f"FASTER in travel time ({opt_time:.0f} min vs {std_time:.0f} min) — it uses higher-speed "
+            "paved roads instead of a shorter, slow, rough shortcut. Less time on the road = less "
+            "spoilage, so there is no conflict with the cold-chain goal: the distance is longer, the "
+            "hours are not."
+        )
+    else:
+        panel_note = (
+            f"The chosen route is {opt_km:.0f} km / {opt_time:.0f} min versus the standard "
+            f"{std_km:.0f} km / {std_time:.0f} min. It accepts {opt_time - std_time:.0f} extra minutes to "
+            f"avoid ~{rough_km_avoided:.0f} km of rough road, because spoilage is weighted 50/50 between "
+            "time (thermal/heat exposure) and roughness (mechanical/vibration) — here the vibration and "
+            "seal damage avoided outweighs the added heat exposure. If you want strictly minimum time, "
+            "lower MECH_WEIGHT so time dominates the objective."
+        )
+
     return {
         "routes_differ": routes_differ,
         "chosen": "spoilage_optimized",
         "time_delta_mins": time_delta_mins,
         "spoilage_reduction_pts": spoilage_delta_pct,
         "rough_km_avoided": rough_km_avoided,
+        "optimized_time_mins": round(opt_time, 1),
+        "standard_time_mins": round(std_time, 1),
+        "optimized_km": round(opt_km, 1),
+        "standard_km": round(std_km, 1),
         "standard_summary": standard_summary,
         "optimized_summary": optimized_summary,
         "reason": reason,
+        "panel_note": panel_note,
         "boundary_note": boundary_note,
     }
 
@@ -1025,6 +1093,9 @@ def freeze_hardware_sim_plan(origin_node: int, destination_node: int, optimized:
         "planned_rough_km": summary["rough_km"],
         "planned_spoilage_pct": optimized["spoilage_risk_pct"],
         "planned_surface_profile": summary["profile"],
+        # Full build_route dict (segments + coordinates) so the map can draw a
+        # STABLE planned line for hardware trips instead of re-snapping each poll.
+        "optimized_route_full": optimized,
         "frozen_at_ts": int(time.time()),
         "monte_carlo": None,
     }
@@ -1741,9 +1812,28 @@ def get_routing() -> dict:
 
     current_node, snap_distance_km = node_index.snap(current_lat, current_lon)
 
+    # STABLE line for the map to draw. The live optimized/standard routes are
+    # recomputed from the truck's CURRENT snapped node every poll — great for the
+    # shrinking "remaining" metrics, but as the truck moves that snap jumps
+    # between nearby nodes and the first hops flip, which made the drawn line
+    # look squiggly/jittery. `display_route` is the FIXED full-journey planned
+    # route (frozen at departure) — it never re-snaps, so the drawn line is
+    # smooth and stable; the truck marker simply moves along it.
+    if mode == "simulator" and trip_plan is not None:
+        display_route = trip_plan["optimized_route"]
+    elif mode == "hardware":
+        with state_lock:
+            _sim_plan = trip_state["hardware_sim_plan"]
+        display_route = (_sim_plan.get("optimized_route_full") if _sim_plan else None) or optimized
+    else:
+        display_route = optimized
+
     return {
         "vehicle_id": VEHICLE_ID,
         "feed_source": feed_source,
+        # Stable planned line for the map (see note above); metrics still use the
+        # live optimized/standard routes below.
+        "display_route": display_route,
         "snapped_node_id": current_node,
         "snap_distance_km": round(snap_distance_km, 3),
         "gps_fix_confidence": gps_fix_confidence(snap_distance_km),
@@ -1911,7 +2001,9 @@ def submit_report(report: FieldReport) -> dict:
     roughness_override = ROAD_CONDITION_ROUGHNESS[report.road_condition]
     length_km = live_topology[matched_u][matched_v]["length_km"]
     travel_time_override_hr = length_km / report.actual_speed
-    spoilage_cost_override = travel_time_override_hr * roughness_override
+    # Same two-component (thermal + mechanical) weight the rest of the graph uses,
+    # so a driver report is priced consistently with the routing objective.
+    spoilage_cost_override = travel_time_override_hr * (THERMAL_SPOIL_WEIGHT + MECH_SPOIL_WEIGHT * roughness_override)
 
     override_record = {
         "reporter_role": report.reporter_role,
@@ -1951,8 +2043,7 @@ def generate_ai_strategy(payload: StrategyRequest) -> dict:
     (never re-derives them) and passes them to a locally hosted Qwen2.5-1.5B
     model via `transformers`, asking it to turn the numbers into a business
     strategy memo. Runs entirely on-box — no external API calls, no data
-    leaves the machine, no separate daemon (unlike Ollama) needs to be
-    installed or started.
+    leaves the machine, no separate daemon needs to be installed or started.
 
     Fails soft: if `transformers` isn't installed or the model can't be
     loaded/run, this returns a 200 with a clean {"status": "error", ...}
@@ -2086,10 +2177,10 @@ def generate_ai_strategy(payload: StrategyRequest) -> dict:
     )
 
     try:
-        # 1100 tokens (was 700): the previous budget cut the memo off mid-way
-        # through its final action list. A cold-chain strategy memo with an
-        # intro, separate mechanical + thermal sections, a wear-and-tear note,
-        # and a completed prioritized action list needs the extra headroom.
+        # 1100 tokens: a cold-chain strategy memo with an intro, separate
+        # mechanical + thermal sections, the fuel/tyre/premium levers, and a
+        # completed prioritized action list needs the headroom so it doesn't
+        # cut off mid-sentence.
         output = generator(messages, max_new_tokens=1100, do_sample=True, temperature=0.35)
     except Exception as exc:  # noqa: BLE001 - deliberately broad: any local inference
         # failure mode must degrade to a clean JSON error, never propagate and

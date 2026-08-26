@@ -382,9 +382,19 @@ def render_live_map(initial_routing: dict | None, initial_telematics: dict) -> N
     truck_lon = initial_telematics["lon"]
     feed_source = initial_telematics.get("feed_source", "")
 
-    initial_standard = initial_routing["standard_route"]["segments"] if initial_routing else []
-    initial_optimized = initial_routing["optimized_route"]["segments"] if initial_routing else []
-    initial_dest = initial_routing["optimized_route"]["coordinates"][-1] if initial_routing else None
+    # Draw the STABLE planned lines (display_route + the plan's standard route)
+    # so the map doesn't re-snap and squiggle as the truck moves. Fall back to
+    # the live routes if no plan is available yet.
+    if initial_routing:
+        _disp = initial_routing.get("display_route") or initial_routing.get("optimized_route")
+        _plan = initial_routing.get("trip_plan") or {}
+        _std = _plan.get("standard_route") or initial_routing.get("standard_route")
+    else:
+        _disp = None
+        _std = None
+    initial_standard = _std["segments"] if _std else []
+    initial_optimized = _disp["segments"] if _disp else []
+    initial_dest = _disp["coordinates"][-1] if _disp else None
     dest_label = initial_routing.get("destination_town", "") if initial_routing else ""
 
     html = f"""
@@ -458,13 +468,20 @@ def render_live_map(initial_routing: dict | None, initial_telematics: dict) -> N
           const res = await fetch(BACKEND + '/v1/routing/truck-01');
           if (!res.ok) return;
           const data = await res.json();
-          const key = routeKey(data.optimized_route.segments);
+          // Use the STABLE planned lines so the drawn route never re-snaps/
+          // squiggles as the truck moves; only a genuine reroute (driver report
+          // or trip reconfigure) changes them and triggers a redraw.
+          const opt = data.display_route || data.optimized_route;
+          const plan = data.trip_plan || {{}};
+          const std = plan.standard_route || data.standard_route;
+          if (!opt || !std) return;
+          const key = routeKey(opt.segments);
           if (key !== lastOptimizedKey) {{
-            drawSegments(data.standard_route.segments, standardLayer, STANDARD_COLOR, true, 'standard route');
-            drawSegments(data.optimized_route.segments, optimizedLayer, OPTIMIZED_COLOR, false, 'optimized route');
+            drawSegments(std.segments, standardLayer, STANDARD_COLOR, true, 'standard route');
+            drawSegments(opt.segments, optimizedLayer, OPTIMIZED_COLOR, false, 'optimized route');
             lastOptimizedKey = key;
           }}
-          const destCoords = data.optimized_route.coordinates[data.optimized_route.coordinates.length - 1];
+          const destCoords = opt.coordinates[opt.coordinates.length - 1];
           if (destMarker) {{
             destMarker.setLatLng([destCoords[1], destCoords[0]]);
             destMarker.setTooltipContent('Destination: ' + (data.destination_town || ''));
@@ -1284,7 +1301,8 @@ with tab_ai_report:
     st.caption(
         "Reads the live routing, cargo-risk, and weather metrics and asks a locally hosted "
         "Qwen2.5-1.5B model to turn them into a comprehensive business-strategy memo. Runs "
-        "entirely on-box; the first report may take a minute or two while the model loads."
+        "entirely on-box; the first report may take a minute or two while the model loads, then "
+        "subsequent reports are fast (the model stays cached)."
     )
 
     strategy_routing = backend_get("/v1/routing/truck-01", silent=True)
@@ -1367,7 +1385,8 @@ with tab_ai_report:
                     eval_result = backend_post("/v1/analytics/strategy", json_body=eval_payload, timeout=600)
                 if eval_result is not None:
                     if eval_result.get("status") == "success":
-                        st.markdown(eval_result["strategy_markdown"])
+                        st.markdown(eval_result.get("strategy_markdown", ""))
+                        st.caption(f"Generated on-box by `{eval_result.get('model', 'local model')}`.")
                     else:
                         st.error(eval_result.get("message", "AI evaluation report failed."))
     elif strategy_routing is None or strategy_routing.get("trip_plan") is None:
@@ -1401,6 +1420,23 @@ with tab_ai_report:
                 f"{rationale['time_delta_mins']:+.0f} min" if rationale["routes_differ"] else "0 min",
             )
             rj_cols[2].metric("Spoilage risk cut", f"{rationale['spoilage_reduction_pts']:.1f} pts")
+
+            # Distance AND time side by side — the key to the "why so long?"
+            # question: the map shows km, but the objective minimizes time-driven
+            # spoilage, so a longer-in-km route is fine when it's faster in hours.
+            dt_cols = st.columns(2)
+            dt_cols[0].metric(
+                "Optimized route",
+                f"{rationale.get('optimized_km', 0):.0f} km",
+                delta=f"{rationale.get('optimized_time_mins', 0):.0f} min", delta_color="off",
+            )
+            dt_cols[1].metric(
+                "Standard route",
+                f"{rationale.get('standard_km', 0):.0f} km",
+                delta=f"{rationale.get('standard_time_mins', 0):.0f} min", delta_color="off",
+            )
+            if rationale.get("panel_note"):
+                st.info("📋 **For the panel — why the optimal route can look long:** " + rationale["panel_note"])
             st.markdown(rationale["reason"])
             opt_s = rationale["optimized_summary"]
             std_s = rationale["standard_summary"]
@@ -1455,18 +1491,23 @@ with tab_ai_report:
 
             logger.info("AI STRATEGY REQUEST -> dispatching trip-plan metrics to backend: %s", strategy_payload)
 
+            # Generous timeout: the local daemon keeps the model warm, so calls
+            # are usually quick, but a first cold-start pull or a slow CPU box can
+            # still take a while — better to wait than to false-timeout.
             STRATEGY_TIMEOUT_SECONDS = 600
-            with st.spinner("🤖 Local model compiling econometric recommendations... (typically 3-6 minutes on CPU)"):
+            with st.spinner("🤖 Local model compiling econometric recommendations... (first run ~2-4 min on CPU while it loads, then fast)"):
                 strategy_result = backend_post(
                     "/v1/analytics/strategy", json_body=strategy_payload, timeout=STRATEGY_TIMEOUT_SECONDS
                 )
 
             if strategy_result is not None:
                 if strategy_result.get("status") == "success":
-                    st.markdown(strategy_result["strategy_markdown"])
+                    strategy_markdown = strategy_result.get("strategy_markdown", "")
+                    st.markdown(strategy_markdown)
+                    st.caption(f"Generated on-box by `{strategy_result.get('model', 'local model')}`.")
                     logger.info(
                         "AI STRATEGY REPORT -> received %d characters from model '%s'",
-                        len(strategy_result["strategy_markdown"]), strategy_result.get("model", "?"),
+                        len(strategy_markdown), strategy_result.get("model", "?"),
                     )
                 else:
                     st.error(strategy_result.get("message", "AI strategy generation failed."))

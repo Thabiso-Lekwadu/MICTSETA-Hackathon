@@ -135,6 +135,13 @@ REEFER_SETPOINT_C: float = -18.5         # the unit tries to hold this
 SPOILAGE_BREACH_TEMP_C: float = -18.0    # spec: total spoilage = breaching -18.0 C
 SPOILAGE_TOTAL_LOSS_TEMP_C: float = -8.0 # at/above this, cargo treated as a total write-off
 
+# Two-component spoilage edge weight (thermal + mechanical), matching
+# nc_road_network_improved and live_backend so the Monte Carlo route profiling
+# prices edges the same way the live router does. TIME is first-class, so a
+# smooth (roughness 1.0) edge costs exactly its travel time.
+THERMAL_SPOIL_WEIGHT: float = 0.5
+MECH_SPOIL_WEIGHT: float = 0.5
+
 # Discrete Newton's-Law-of-Cooling coefficients (per hour). The reefer chamber
 # exponentially approaches an equilibrium temperature rather than climbing in a
 # straight line — mirrors the idling warm-up model in live_backend.py so the
@@ -636,7 +643,8 @@ def _edge_spoilage(edge_attrs: dict) -> float:
         return float(override["spoilage_cost"])
     if "spoilage_cost" in edge_attrs:
         return float(edge_attrs["spoilage_cost"])
-    return _edge_time_hours(edge_attrs) * float(edge_attrs.get("roughness", 1.3) or 1.3)
+    roughness = float(edge_attrs.get("roughness", 1.3) or 1.3)
+    return _edge_time_hours(edge_attrs) * (THERMAL_SPOIL_WEIGHT + MECH_SPOIL_WEIGHT * roughness)
 
 
 def _spoilage_weight(u: int, v: int, edge_attrs: dict) -> float:
