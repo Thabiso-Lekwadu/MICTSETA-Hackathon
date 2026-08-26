@@ -473,6 +473,13 @@ class StrategyRequest(BaseModel):
     route_adherence_pct: float | None = None
     actual_vs_planned_time_pct: float | None = None
     sim_vs_real_text: str | None = None
+    # Active cargo-risk alert inputs. When alert_mode is true the memo LEADS with
+    # an "## Immediate Cargo-Risk Mitigation" section: driver actions on the road
+    # now, plus dispatcher/office actions.
+    alert_mode: bool | None = None
+    cargo_temp_c: float | None = None
+    safe_temp_max_c: float | None = None
+    cargo_alert_text: str | None = None
 
 
 # Lazily loaded, then cached for the life of the process — loading the model
@@ -1326,6 +1333,139 @@ def compressor_load_pct(speed_kmh: float, ambient_temp_c: float) -> float:
     return round(max(0.0, min(100.0, load)), 1)
 
 
+# Cargo-risk severity ladder, keyed on how far cargo temperature has risen ABOVE
+# the safe baseline (excess °C). The higher it climbs, the more profound the
+# intervention — early "hold the line" measures give way to emergency diversion
+# and salvage. Boundaries are documented assumptions, tunable per cargo.
+CARGO_RISK_LEVEL_1_MAX_EXCESS_C = 1.5   # marginal breach
+CARGO_RISK_LEVEL_2_MAX_EXCESS_C = 3.5   # rising
+CARGO_RISK_LEVEL_3_MAX_EXCESS_C = 6.0   # serious (above this = emergency)
+
+
+def cargo_risk_level(cargo_temp_c: float, safe_max_c: float) -> int:
+    """Severity 1-4 from how far cargo temperature is above the safe baseline."""
+    excess = cargo_temp_c - safe_max_c
+    if excess <= CARGO_RISK_LEVEL_1_MAX_EXCESS_C:
+        return 1
+    if excess <= CARGO_RISK_LEVEL_2_MAX_EXCESS_C:
+        return 2
+    if excess <= CARGO_RISK_LEVEL_3_MAX_EXCESS_C:
+        return 3
+    return 4
+
+
+def driver_action_items(cargo_temp_c: float, status: str, ambient_temp_c: float,
+                        compressor_pct: float, safe_max_c: float) -> list[str]:
+    """Concrete, prioritized, ESCALATING actions a DRIVER should take on the road
+    while cargo temperature is above the safe baseline. Fully deterministic (no
+    LLM) so it is instantaneous and always available — this is the driver's view
+    on the Customer Route Tracker while the business gets the fuller AI memo.
+
+    The list changes with severity: the further above baseline the load climbs,
+    the more profound the intervention (from 'hold the reefer flat-out' up to
+    'divert to cold storage now / begin the breach log'). Items are always
+    de-duplicated, and the whole panel keeps showing until the cargo cools back
+    to or below the baseline (at which point status returns to Nominal and this
+    list is emptied by the caller)."""
+    excess = cargo_temp_c - safe_max_c
+    level = cargo_risk_level(cargo_temp_c, safe_max_c)
+    items: list[str] = []
+
+    # --- Severity header (escalates) ---------------------------------------
+    if level == 1:
+        items.append(
+            f"⚠️ Cargo is {cargo_temp_c:.1f} °C — just over the {safe_max_c:.1f} °C safe limit "
+            f"(+{excess:.1f} °C). Hold the line now, before it climbs."
+        )
+    elif level == 2:
+        items.append(
+            f"⚠️ Cargo is RISING — {cargo_temp_c:.1f} °C, now +{excess:.1f} °C over the "
+            f"{safe_max_c:.1f} °C limit. Step up cooling measures immediately."
+        )
+    elif level == 3:
+        items.append(
+            f"🔴 SERIOUS: cargo is {cargo_temp_c:.1f} °C, +{excess:.1f} °C over the "
+            f"{safe_max_c:.1f} °C limit. Take emergency cooling action and call dispatch now."
+        )
+    else:
+        items.append(
+            f"🛑 EMERGENCY: cargo is {cargo_temp_c:.1f} °C, +{excess:.1f} °C over the "
+            f"{safe_max_c:.1f} °C limit — the load may already be compromised. Divert to cold storage NOW."
+        )
+
+    # --- Level 1+ : foundational reefer actions (always shown) --------------
+    items.append("Do NOT open the reefer doors — every opening dumps cold air and spikes the temperature.")
+    items.append(
+        "Set the reefer to CONTINUOUS run mode (not cycle/start-stop) and drop the setpoint to its "
+        "minimum so the compressor runs flat-out."
+    )
+    items.append(
+        "Keep the truck moving at a steady speed on the paved sections — airflow across the condenser is "
+        "what actually pulls heat out; a stopped reefer in the sun loses ground fast."
+    )
+    if ambient_temp_c >= EXTREME_HEAT_THRESHOLD_C:
+        items.append(
+            f"Extreme heat outside ({ambient_temp_c:.0f} °C) is choking the condenser. If you must stop, "
+            "park in deep shade with the reefer unit facing away from the sun — never nose-into-sun in the open."
+        )
+    if compressor_pct >= 99.0:
+        items.append(
+            "Reefer compressor is pinned at 100%. Check the reefer fuel/diesel level now — if it starves, "
+            "cooling stops entirely; top up at the next opportunity."
+        )
+
+    # --- Level 2+ : diagnose and remove what's blocking the cold ------------
+    if level >= 2:
+        items.append(
+            "Check the reefer control panel for a fault or alarm code. If the unit has tripped or is "
+            "defrosting, restart it and confirm it resumes cooling."
+        )
+        items.append(
+            "Make sure return air to the evaporator is clear — cargo must not be packed against the unit; "
+            "keep the air chute and the floor channels open so cold air can circulate through the load."
+        )
+        items.append(
+            "Cut out every non-essential stop. Idle time in desert heat is where a chilled load is lost."
+        )
+
+    # --- Level 3+ : escalate, add active cooling, plan a diversion ----------
+    if level >= 3:
+        items.append(
+            "Call dispatch and the cold-chain manager immediately — this load now needs a decision, not just a driver fix."
+        )
+        items.append(
+            "Deploy any emergency coolant you carry — dry ice, gel packs or extra ice into the chamber — and "
+            "cover exposed cargo with thermal/insulation blankets to slow the heat gain."
+        )
+        items.append(
+            "Head for the NEAREST cold-storage facility or depot to re-ice or transfer the load; dispatch will "
+            "send the location and call ahead so it's ready when you arrive."
+        )
+
+    # --- Level 4 : emergency / salvage -------------------------------------
+    if level >= 4:
+        items.append(
+            "EMERGENCY DIVERSION: get to the nearest cold store now — do not continue to the original "
+            "destination while the load is climbing this far over limit."
+        )
+        items.append(
+            "Dispatch: notify the buyer, open the insurance/claim record, and prepare a salvage or re-grade "
+            "plan for whatever can still be recovered."
+        )
+
+    # --- Always last : the audit record ------------------------------------
+    items.append("Photograph the reefer display (temperature + setpoint) and log the time and GPS for the cold-chain breach record.")
+
+    # Guarantee no repeats regardless of which tiers fired.
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for item in items:
+        if item not in seen:
+            seen.add(item)
+            deduped.append(item)
+    return deduped
+
+
 def integrate_thermal_risk_hours(elapsed_hours: float, total_hours: float, steps: int = 200) -> float:
     """Numerically integrates the known simulated temperature curve from 0 to
     elapsed_hours, weighting each instant by its thermal_rate_multiplier.
@@ -1749,6 +1889,25 @@ def get_telematics() -> dict:
             tracking_state.get("speed_kmh", 0.0), CURRENT_WEATHER["temp_c"]
         )
 
+        # Cargo-risk trigger. When the load passes the safe baseline mid-trip,
+        # attach concrete driver action items — these surface on the Customer
+        # Route Tracker (driver view) AND flag the business Report tab to offer
+        # an AI mitigation memo. Only populated while genuinely at risk and
+        # moving (not while parked/awaiting motion).
+        cargo_at_risk = payload["cargo_temp_status"] in ("Elevated", "Critical")
+        payload["cargo_at_risk"] = cargo_at_risk
+        payload["cargo_risk_level"] = (
+            cargo_risk_level(tracking_state["cargo_temp_c"], live_settings["safe_temp_max_c"])
+            if cargo_at_risk else 0
+        )
+        payload["driver_action_items"] = (
+            driver_action_items(
+                tracking_state["cargo_temp_c"], payload["cargo_temp_status"],
+                CURRENT_WEATHER["temp_c"], payload["compressor_load_pct"],
+                live_settings["safe_temp_max_c"],
+            ) if cargo_at_risk else []
+        )
+
         if trip_state["configured"] and trip_state["mode"] == "simulator" and trip_state["sim_total_hours"]:
             elapsed_real_s = time.monotonic() - trip_state["trip_start_ts"]
             elapsed_sim_hours = (elapsed_real_s * SIM_TIME_ACCELERATION) / 3600.0
@@ -2094,6 +2253,18 @@ def generate_ai_strategy(payload: StrategyRequest) -> dict:
             f"- Live weather alert status: {payload.weather_alert or 'Normal'}\n"
         )
 
+    cargo_alert_section = ""
+    if payload.alert_mode:
+        cargo_alert_section = (
+            "\nACTIVE CARGO-RISK ALERT (the load has passed its safe temperature RIGHT NOW — write an "
+            "'## Immediate Cargo-Risk Mitigation' section FIRST, before anything else):\n"
+            f"- Current cargo temperature: {payload.cargo_temp_c if payload.cargo_temp_c is not None else 'n/a'} °C "
+            f"vs safe maximum {payload.safe_temp_max_c if payload.safe_temp_max_c is not None else 'n/a'} °C\n"
+            f"- Cargo status: {payload.cargo_temp_status}\n"
+            f"- Thermal risk accrued so far: {payload.thermal_risk_pct:.1f}%\n"
+            f"- Driver action items the system has already issued on the road: {payload.cargo_alert_text or 'n/a'}\n"
+        )
+
     sim_vs_real_section = ""
     if payload.evaluation_mode == "hardware":
         sim_vs_real_section = (
@@ -2133,6 +2304,7 @@ def generate_ai_strategy(payload: StrategyRequest) -> dict:
         f"- Current cargo temperature status: {payload.cargo_temp_status}\n"
         f"- Road surface profile along the optimized route: {payload.surface_profile}\n"
         f"{weather_section}"
+        f"{cargo_alert_section}"
         f"{route_justification_section}"
         f"{sim_vs_real_section}"
         f"- Total shipment value at risk: R {payload.shipment_value_rand:,.0f}\n\n"
@@ -2150,7 +2322,11 @@ def generate_ai_strategy(payload: StrategyRequest) -> dict:
         "dispatch manager: quantify the Rand-value trade-off between extra travel time and "
         "spoilage avoided, address both the mechanical and thermal risk components separately, "
         "note the vehicle wear-and-tear implication of the surface profile, and recommend "
-        "whether this shipment should take the standard or the optimized route. If ROUTE-SELECTION "
+        "whether this shipment should take the standard or the optimized route. If an ACTIVE "
+        "CARGO-RISK ALERT was provided, you MUST open the memo with a '## Immediate Cargo-Risk "
+        "Mitigation' section that gives (a) what the DRIVER should do on the road in the next few "
+        "minutes and (b) what the DISPATCH OFFICE should do now (contact driver, ready the nearest "
+        "cold store, notify the buyer), before the rest of the analysis. If ROUTE-SELECTION "
         "FACTS were provided above, include a dedicated '## Route Justification' section that "
         "explains, in plain language for a non-technical manager, WHY the system chose this "
         "specific route and did NOT choose the standard route or any other road on the map — "

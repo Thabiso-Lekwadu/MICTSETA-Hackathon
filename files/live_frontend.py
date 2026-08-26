@@ -641,6 +641,7 @@ with tab_tracker:
         tracker_ui["cargo_temp"] = card_cols[2].empty()
         tracker_ui["compressor"] = card_cols[3].empty()
         tracker_ui["status_banner"] = st.empty()
+        tracker_ui["action_panel"] = st.empty()
         tracker_ui["chart_header"] = st.empty()
         tracker_ui["chart"] = st.empty()
         tracker_ui["chart_caption"] = st.empty()
@@ -704,6 +705,30 @@ with tab_tracker:
                 tracker_ui["status_banner"].success(
                     f"✅ Cargo temperature nominal at {cargo_temp_c:.1f} °C (safe baseline {safe_baseline:.1f} °C)."
                 )
+
+            # --- DRIVER ACTION ITEMS (driver's view, on the road) ------------
+            # When the load passes the safe baseline, show the concrete steps the
+            # driver should take right now. This is the driver-facing half of the
+            # cargo-risk trigger; the business office gets the fuller AI mitigation
+            # memo in the Report tab off the same event.
+            if telematics.get("cargo_at_risk"):
+                items = telematics.get("driver_action_items", [])
+                level = telematics.get("cargo_risk_level", 1)
+                header = {
+                    1: "⚠️ DRIVER ACTION REQUIRED — cargo just over the safe temperature",
+                    2: "⚠️ DRIVER ACTION REQUIRED — cargo temperature RISING",
+                    3: "🔴 DRIVER ACTION REQUIRED — SERIOUS cargo temperature breach",
+                    4: "🛑 DRIVER ACTION — EMERGENCY: cargo may be compromised",
+                }.get(level, "🚨 DRIVER ACTION REQUIRED — cargo above the safe temperature")
+                # Render the whole list as ONE markdown block (not a per-item
+                # loop) so the panel can never stack/duplicate on a fragment
+                # rerun. The panel keeps showing until the cargo cools back to
+                # the baseline, at which point cargo_at_risk clears.
+                with tracker_ui["action_panel"].container():
+                    (st.error if level >= 3 else st.warning)(header)
+                    st.markdown("\n".join(f"- {it}" for it in items))
+            else:
+                tracker_ui["action_panel"].empty()
 
             # --- Live cold-chain temperature chart with the safe baseline -----
             # Appends one point per poll while the trip is genuinely underway
@@ -1309,6 +1334,51 @@ with tab_ai_report:
     strategy_telematics = backend_get("/v1/telematics/truck-01", silent=True)
 
     is_hardware_mode = st.session_state.telemetry_mode == MODE_HARDWARE
+
+    # --- Cargo-risk trigger (business/office view) --------------------------
+    # Fires off the SAME event the driver sees on the Customer Route Tracker:
+    # when the load passes its safe temperature, the office gets a red alert, the
+    # exact action items the driver is seeing, and a one-click AI memo that leads
+    # with immediate mitigation (driver + dispatch actions).
+    if st.session_state.trip_configured and (strategy_telematics or {}).get("cargo_at_risk"):
+        st.error(
+            "🚨 CARGO AT RISK — the load has passed its safe temperature. The driver has the action "
+            "items on their tracker; generate the mitigation memo for the office below."
+        )
+        risk_action_items = (strategy_telematics or {}).get("driver_action_items", [])
+        with st.expander("Action items the driver is seeing right now (Customer Route Tracker)", expanded=True):
+            st.markdown("\n".join(f"- {_item}" for _item in risk_action_items))
+        if st.button("🚨 Generate Cargo-Risk Mitigation Report (AI)", use_container_width=True, key="cargo_mitigation_btn"):
+            _amb = (strategy_telematics or {}).get("ambient_weather") or {}
+            _cfg = st.session_state.last_config or {}
+            alert_payload = {
+                "origin": _cfg.get("origin") or "Live position",
+                "destination": _cfg.get("destination") or "Destination",
+                "standard_time_mins": 0.0,
+                "optimized_time_mins": 0.0,
+                "rand_saved": 0.0,
+                "mechanical_risk_reduction_pct": 0.0,
+                "thermal_risk_pct": (strategy_telematics or {}).get("thermal_risk_pct", 0.0),
+                "cargo_temp_status": (strategy_telematics or {}).get("cargo_temp_status", "Elevated"),
+                "surface_profile": "n/a",
+                "shipment_value_rand": float(st.session_state.shipment_value_rand),
+                "ambient_temp_c": _amb.get("temp_c"),
+                "rain_mm": _amb.get("rain_mm"),
+                "weather_alert": _amb.get("alert"),
+                "alert_mode": True,
+                "cargo_temp_c": (strategy_telematics or {}).get("cargo_temp_c"),
+                "safe_temp_max_c": float(st.session_state.safe_temp_max_c),
+                "cargo_alert_text": " ".join(risk_action_items),
+            }
+            with st.spinner("🤖 Generating immediate cargo-risk mitigation memo…"):
+                alert_result = backend_post("/v1/analytics/strategy", json_body=alert_payload, timeout=600)
+            if alert_result is not None:
+                if alert_result.get("status") == "success":
+                    st.markdown(alert_result.get("strategy_markdown", ""))
+                    st.caption(f"Generated on-box by `{alert_result.get('model', 'local model')}`.")
+                else:
+                    st.error(alert_result.get("message", "Mitigation report failed."))
+        st.divider()
 
     if not st.session_state.trip_configured:
         st.info("Start a trip in the sidebar first — the report is built from that trip's live metrics.")
