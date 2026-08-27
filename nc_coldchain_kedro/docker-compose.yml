@@ -1,0 +1,91 @@
+# =============================================================================
+# `docker compose up --build` runs the WHOLE product with no manual commands:
+#   pipeline (kedro run) -> writes artifacts incl. nc_road_graph.pkl
+#     -> live-backend (your FastAPI app) loads that graph and serves the AI /
+#        weather / telematics / routing API
+#       -> live-frontend (your Streamlit 5-tab app) talks to the backend
+#
+# The live app is the real product. A lightweight artifacts API + graph viewer
+# is also available under `--profile artifacts` for a pure pipeline-output view.
+# =============================================================================
+services:
+
+  pipeline:
+    build: .
+    image: nc_coldchain:latest
+    command: ["bash", "docker/run_pipeline.sh"]
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-local}
+      RUN_PIPELINE_ON_START: ${RUN_PIPELINE_ON_START:-true}
+      USE_SYNTHETIC_DATA: ${USE_SYNTHETIC_DATA:-true}
+      RANDOM_SEED: ${RANDOM_SEED:-42}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - nc_data:/app/data
+      - ./data/01_raw:/app/data/01_raw     # drop new raw data here
+
+  # ---- The live product (AI + weather + telematics + routing) ----------------
+  live-backend:
+    image: nc_coldchain:latest
+    command: ["uvicorn", "app.live_backend:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      NC_ROAD_GRAPH: /app/data/08_graph/optimized/nc_road_graph.pkl
+    ports:
+      - "${API_PORT:-8000}:8000"
+    volumes:
+      - nc_data:/app/data
+    depends_on:
+      pipeline:
+        condition: service_completed_successfully   # graph must exist first
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+
+  live-frontend:
+    image: nc_coldchain:latest
+    command: ["streamlit", "run", "app/live_frontend.py",
+              "--server.port=8501", "--server.address=0.0.0.0"]
+    environment:
+      BACKEND_URL: http://live-backend:8000
+    ports:
+      - "${FRONTEND_PORT:-8501}:8501"
+    volumes:
+      - nc_data:/app/data
+    depends_on:
+      live-backend:
+        condition: service_healthy
+
+  # ---- Optional: pipeline-artifacts API + graph viewer (profile: artifacts) --
+  artifacts-api:
+    image: nc_coldchain:latest
+    profiles: ["artifacts"]
+    command: ["uvicorn", "app.backend.main:app", "--host", "0.0.0.0", "--port", "8100"]
+    environment:
+      DATA_PATH: /app/data
+    ports:
+      - "8100:8100"
+    volumes:
+      - nc_data:/app/data
+    depends_on:
+      pipeline:
+        condition: service_completed_successfully
+
+  graph-viewer:
+    image: nc_coldchain:latest
+    profiles: ["artifacts"]
+    command: ["streamlit", "run", "app/frontend/streamlit_app.py",
+              "--server.port=8601", "--server.address=0.0.0.0"]
+    environment:
+      BACKEND_URL: http://artifacts-api:8100
+    ports:
+      - "8601:8601"
+    volumes:
+      - nc_data:/app/data
+    depends_on:
+      artifacts-api:
+        condition: service_started
+
+volumes:
+  nc_data:

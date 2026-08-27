@@ -1,0 +1,110 @@
+# =============================================================================
+# NC Cold-Chain :: central parameters. NOTHING operational is hard-coded in nodes;
+# every threshold, seed, weight, count and path-relevant value lives here.
+# =============================================================================
+
+reproducibility:
+  random_seed: 42            # governs synthetic data, Monte Carlo, optimisation
+  deterministic: true        # dev/test reproducible; set false for stochastic prod
+
+runtime:
+  use_synthetic_data: true   # generate synthetic streams as part of the workflow
+  n_synthetic_hours: 72      # length of each synthetic stream
+  use_live_weather: false    # true -> call OpenWeatherMap (needs key) for MC ambient
+
+# --- Service network (data-driven; NOT hard-coded in Python) --------------------
+network:
+  # ---- ROAD-NETWORK SOURCE -----------------------------------------------------
+  # 'osm'       : build the graph from the REAL OpenStreetMap network (production).
+  #               The optimiser runs Dijkstra over the actual road topology.
+  # 'synthetic' : corridor abstraction for offline testing only (clearly logged).
+  road_source: osm
+  # Where the OSM extract lives / is written. Accepts .gpkg / .geojson / .parquet.
+  # NOT hard-coded in Python — change here.
+  osm_road_path: data/01_raw/map/northern_cape_roads.gpkg
+  # Pull the map straight from OpenStreetMap (Geofabrik) if the extract is absent.
+  # true  -> the extract_osm_roads node downloads South Africa roads and slices to
+  #          the Northern Cape bbox (needs internet + geopandas/pyogrio; ~large DL).
+  # false -> you supply the extract yourself at osm_road_path.
+  download_osm: true
+  osm_download_url: "https://download.geofabrik.de/africa/south-africa-latest-free.shp.zip"
+  osm_bbox: [16.45, -31.85, 25.30, -24.60]   # [min_lon, min_lat, max_lon, max_lat]
+  # Safety switch: with road_source='osm', a MISSING extract FAILS the run unless
+  # this is true. Keep false so a synthetic graph is never shipped by accident.
+  allow_synthetic_fallback: false
+  towns:                     # name -> [lon, lat] for the seven NC service towns
+    Kimberley:    [24.7623, -28.7420]
+    Upington:     [21.2561, -28.4478]
+    Springbok:    [17.8853, -29.6643]
+    De_Aar:       [24.0122, -30.6497]
+    Kuruman:      [23.4333, -27.4525]
+    Port_Nolloth: [16.8690, -29.2530]
+    Calvinia:     [19.7758, -31.4707]
+  border_posts:              # name -> [lon, lat] cross-border handling points
+    Nakop:        [20.0500, -28.6000]
+    Vioolsdrif:   [17.6167, -28.7667]
+  boundary_geojson: data/01_raw/map/northern_cape_boundary.geojson
+  border_include_km: 25.0    # buffer that keeps legitimate near-border roads usable
+  waypoints_per_edge: 2      # synthetic intermediate nodes per town-town corridor
+
+# --- Preprocessing --------------------------------------------------------------
+preprocessing:
+  drop_duplicate_keys: [hour_index, timestamp_iso]
+  max_missing_fraction: 0.30 # a column above this is flagged, not silently filled
+  impute_numeric_strategy: median
+
+# --- Data audit thresholds ------------------------------------------------------
+audit:
+  ambient_temp_c: {min: -5.0, max: 55.0}
+  cargo_temp_c:   {min: -30.0, max: 25.0}
+  iri:            {min: 0.0, max: 20.0}
+  safe_speed_kmh: {min: 5.0, max: 140.0}
+  outlier_z_threshold: 4.0
+  duplicate_tolerance: 0            # 0 duplicate rows tolerated after cleaning
+  max_missing_fraction: 0.30
+  # a rebuild is demanded when the audit sees graph-relevant change beyond these:
+  rebuild_triggers:
+    node_count_delta: 0             # any node appear/disappear -> rebuild
+    edge_count_delta: 0
+    mean_edge_weight_pct: 5.0       # >5% shift in mean edge weight -> rebuild
+
+# --- Graph construction ---------------------------------------------------------
+graph:
+  thermal_weight: 0.5
+  mech_weight: 0.5
+  roughness_exponent: 1.0
+  default_speed_kmh: 90.0
+  require_connected: true
+
+# --- Graph optimisation ---------------------------------------------------------
+optimization:
+  # candidate spoilage-weight blends to search; objective = mean OD spoilage cost
+  candidate_weights:
+    - {thermal: 0.7, mech: 0.3}
+    - {thermal: 0.5, mech: 0.5}
+    - {thermal: 0.3, mech: 0.7}
+  evaluation_pairs:                 # OD pairs the objective is measured over
+    - [Kimberley, Upington]
+    - [Kimberley, Port_Nolloth]
+    - [Upington, Springbok]
+    - [De_Aar, Calvinia]
+  objective: min_mean_spoilage_cost
+
+# --- Monte Carlo ----------------------------------------------------------------
+monte_carlo:
+  trials: 1000
+  thermal_noise_std_c: 2.5
+  border_delay_mean_s: 300
+  border_delay_std_s: 45
+  infra_shock_prob: 0.05
+  breach_threshold_c: -18.0
+  var_percentile: 95
+  shipment_value_rand: 450000
+  ambient_temp_c: 32.0              # scenario ambient for the risk run
+  evaluation_pairs:
+    - [Kimberley, Upington]
+    - [Kimberley, Port_Nolloth]
+
+# --- Reporting ------------------------------------------------------------------
+reporting:
+  currency: ZAR

@@ -1,0 +1,132 @@
+# =============================================================================
+# NC Cold-Chain Data Catalog. Every meaningful dataset has an entry and a layer.
+# No node reads or writes a hard-coded path; all paths are declared here.
+# Layers: 01_raw 02_intermediate 03_primary 04_feature 05_model_input
+#         06_models 07_model_output 08_graph 09_reporting
+# =============================================================================
+
+# ---------------------------------------------------------------- 01_raw --------
+raw_town_registry:
+  type: json.JSONDataset
+  filepath: data/01_raw/map/town_registry.json
+  metadata: {kedro-viz: {layer: "01_raw"}}
+
+raw_boundary_polygon:
+  type: json.JSONDataset
+  filepath: data/01_raw/map/boundary_polygon.json
+  metadata: {kedro-viz: {layer: "01_raw"}}
+
+raw_drivers_reports:
+  type: pandas.CSVDataset
+  filepath: data/01_raw/drivers/drivers_reports.csv
+  metadata: {kedro-viz: {layer: "01_raw"}}
+
+raw_live_weather:
+  type: json.JSONDataset
+  filepath: data/01_raw/weather/live_weather.json
+  metadata: {kedro-viz: {layer: "01_raw"}}
+
+raw_osm_ready:
+  type: json.JSONDataset
+  filepath: data/01_raw/map/osm_ready.json
+  metadata: {kedro-viz: {layer: "01_raw"}}
+
+raw_synthetic_weather:
+  type: pandas.CSVDataset
+  filepath: data/01_raw/synthetic/weather.csv
+  metadata: {kedro-viz: {layer: "01_raw"}}
+
+raw_synthetic_road:
+  type: pandas.CSVDataset
+  filepath: data/01_raw/synthetic/road_conditions.csv
+  metadata: {kedro-viz: {layer: "01_raw"}}
+
+raw_synthetic_sensors:
+  type: pandas.CSVDataset
+  filepath: data/01_raw/synthetic/cold_sensors.csv
+  metadata: {kedro-viz: {layer: "01_raw"}}
+
+# ------------------------------------------------------- 02_intermediate --------
+int_weather:  {type: pandas.ParquetDataset, filepath: data/02_intermediate/weather.parquet}
+int_road:     {type: pandas.ParquetDataset, filepath: data/02_intermediate/road_conditions.parquet}
+int_sensors:  {type: pandas.ParquetDataset, filepath: data/02_intermediate/cold_sensors.parquet}
+int_drivers:  {type: pandas.ParquetDataset, filepath: data/02_intermediate/drivers_reports.parquet}
+
+# ------------------------------------------------------------- 03_primary -------
+prm_weather:  {type: pandas.ParquetDataset, filepath: data/03_primary/weather.parquet}
+prm_road:     {type: pandas.ParquetDataset, filepath: data/03_primary/road_conditions.parquet}
+prm_sensors:  {type: pandas.ParquetDataset, filepath: data/03_primary/cold_sensors.parquet}
+prm_drivers:  {type: pandas.ParquetDataset, filepath: data/03_primary/drivers_reports.parquet}
+
+# ------------------------------------------------------------- 04_feature -------
+feat_graph_nodes: {type: pandas.ParquetDataset, filepath: data/04_feature/graph_nodes.parquet}
+feat_graph_edges: {type: pandas.ParquetDataset, filepath: data/04_feature/graph_edges.parquet}
+
+# --------------------------------------------------------- 05_model_input -------
+model_input_mc_params:
+  type: json.JSONDataset
+  filepath: data/05_model_input/monte_carlo_params.json
+
+# --------------------------------------------------------- audit (reporting) ----
+audit_results:
+  type: json.JSONDataset
+  filepath: data/09_reporting/audit/audit_results.json
+  metadata: {kedro-viz: {layer: "09_reporting"}}
+audit_report:
+  type: pandas.CSVDataset
+  filepath: data/09_reporting/audit/audit_report.csv
+audit_feedback:
+  type: json.JSONDataset
+  filepath: data/09_reporting/audit/audit_feedback.json
+
+# ------------------------------------------------------------- 08_graph ---------
+# The bundle {G_main, main_nodes, cluster_coord, town_nodes} — the SINGLE source
+# of truth, identical in shape to nc_road_network_improved.build_clean_network().
+road_graph_bundle:
+  type: pickle.PickleDataset
+  filepath: data/08_graph/raw/road_graph_bundle.pkl
+  metadata: {kedro-viz: {layer: "08_graph"}}
+
+# THE artifact live_backend.py loads (GRAPH_PATH). Optimised weights baked in.
+nc_road_graph:
+  type: pickle.PickleDataset
+  filepath: data/08_graph/optimized/nc_road_graph.pkl
+  metadata: {kedro-viz: {layer: "08_graph"}}
+graph_validation:
+  type: json.JSONDataset
+  filepath: data/08_graph/raw/validation.json
+graph_metrics:
+  type: json.JSONDataset
+  filepath: data/08_graph/processed/graph_metrics.json
+candidate_graph_scores:
+  type: json.JSONDataset
+  filepath: data/08_graph/optimized/candidate_scores.json
+optimal_graph_published:
+  type: json.JSONDataset
+  filepath: data/08_graph/optimized/optimal_graph.json
+optimal_graph_metadata:
+  type: json.JSONDataset
+  filepath: data/08_graph/optimized/metadata.json
+optimal_graph_geojson:
+  type: json.JSONDataset
+  filepath: data/08_graph/visualizations/optimal_graph.geojson
+
+# ------------------------------------------------------- 07_model_output --------
+monte_carlo_results:
+  type: json.JSONDataset
+  filepath: data/07_model_output/monte_carlo_results.json
+  metadata: {kedro-viz: {layer: "07_model_output"}}
+
+# ------------------------------------------------------------ 09_reporting ------
+data_quality_report:
+  type: json.JSONDataset
+  filepath: data/09_reporting/data_quality_report.json
+graph_change_report:
+  type: json.JSONDataset
+  filepath: data/09_reporting/graph_change_report.json
+simulation_report:
+  type: json.JSONDataset
+  filepath: data/09_reporting/simulation_report.json
+system_status:
+  type: json.JSONDataset
+  filepath: data/09_reporting/system_status.json
